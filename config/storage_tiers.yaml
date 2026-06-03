@@ -1,0 +1,27 @@
+# Storage tiers for the price model — see CLAUDE.md Sections 5 & 7.
+# We do NOT measure retrieval time. read_bytes is COMPUTED (byte_sizes.py); the
+# per-tier knobs below are swept to produce a FAMILY of break-even curves.
+# All values are illustrative published-rate defaults; CONFIRM before final numbers.
+#
+# retrieval_time = read_bytes / (bandwidth_gbps * 1e9)
+# network_cost   = (read_bytes/1e9)*egress_price_usd_per_gb        # data transfer ($/GB)
+#                  + retrieval_time * resource_price               # stalled-resource ($/s)
+# (GB = 1e9 bytes for pricing/bandwidth — cloud-billing convention.)
+# resource_price is NOT a per-tier knob: it is the cost/s of the resource that stalls
+# during retrieval (the H100), read from prices.yaml (compute.gpu_h100_usd_per_hour).
+#
+# NOTE on object storage: S3 Standard has NO per-GB retrieval fee (only IA/Glacier).
+# Egress $0.09/GB is INTERNET only; SAME-REGION S3->GPU egress is ~0. So object storage
+# is split into same_region vs internet — deployment topology, not the tier itself,
+# decides whether reuse pays off.
+
+tiers:
+  local_nvme:
+    usd_per_gb_month: 0.0          # capex sunk, 월 임대 없음
+    bandwidth_gbps: 5.0            # instance-store NVMe
+    egress_price_usd_per_gb: 0.0
+    
+  s3_same_region:
+    usd_per_gb_month: 0.023        # S3 Standard
+    bandwidth_gbps: 1.0            # 병렬 GET, ENI 한계 근처
+    egress_price_usd_per_gb: 0.0

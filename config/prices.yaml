@@ -1,0 +1,16 @@
+# Cloud unit prices for the price model — see CLAUDE.md Section 7.
+# CONSTANTS from published list prices, NOT measured by spinning up instances.
+# >>> Illustrative defaults; CONFIRM against the rates the paper cites.
+# Per-tier storage + network/retrieval params live in config/storage_tiers.yaml
+# (swept to produce a family of break-even curves); only compute + run defaults here.
+
+compute:
+  # GPU-seconds -> $.  T_encode / T_prefill / T_decode are GPU time on the H100.
+  gpu_h100_usd_per_hour: 6.88        # source: confirm (e.g. Lambda/representative on-demand H100)
+  # CPU-seconds -> $.  Video decode/resize (C_preprocess) runs on CPU, priced separately.
+  cpu_usd_per_vcpu_hour: 0.0425      # source: confirm (e.g. general-purpose vCPU on-demand)
+
+defaults:
+  # Knobs the break-even surface sweeps over; overridable per-run.
+  decode_tokens: 256                 # forced fixed decode length (min==max), Section 5
+  retention_time_days: 30            # default retention horizon for C_store * retention

@@ -1,0 +1,33 @@
+# Large / regenerable artifacts — NOT versioned (see CLAUDE.md Sections 4 & 9).
+# NOTE: .gitignore does NOT support trailing comments — keep patterns on their own line.
+
+# LOCAL_SCRATCH: video decode copies & retrieval-timing artifacts (GBs)
+scratch/
+# measurement CSVs (append-only) + figures — regenerable from code
+results/
+*.mp4
+*.avi
+*.mkv
+
+# Model weights / datasets live under /mnt/nas/VLM (HF_HOME) — never in-repo
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.venv/
+venv/
+
+# Logs / scratch output
+*.log
+tmp/
+
+# OS / editor
+.DS_Store
+*.swp

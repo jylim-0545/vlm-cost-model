@@ -33,8 +33,10 @@ _ap.add_argument("--frame", type=int, default=128)
 _ap.add_argument("--dataset", default="nextqa")
 _a = _ap.parse_args()
 MODEL = _a.model; FRAME = _a.frame; DATASET = _a.dataset
-TAG = {"internvl3.5-8b": "internvl8b", "qwen2.5-vl-7b": "qwen25"}.get(MODEL, MODEL.replace(".", "").replace("-", ""))
-TITLE = {"internvl3.5-8b": "InternVL-8B", "qwen2.5-vl-7b": "Qwen2.5-VL"}.get(MODEL, MODEL)
+TAG = {"internvl3.5-8b": "internvl8b", "internvl3.5-4b": "internvl4b", "internvl3.5-14b": "internvl14b",
+       "qwen2.5-vl-7b": "qwen25", "llava-ov-7b": "llavaov"}.get(MODEL, MODEL.replace(".", "").replace("-", ""))
+TITLE = {"internvl3.5-8b": "InternVL-8B", "internvl3.5-4b": "InternVL-4B", "internvl3.5-14b": "InternVL-14B",
+         "qwen2.5-vl-7b": "Qwen2.5-VL", "llava-ov-7b": "LLaVA-OV-7B"}.get(MODEL, MODEL)
 DECODE = 256
 CSV = os.path.expanduser(f"~/VLM/results/{DATASET}/reuse_real.csv")
 OUT = Path(os.path.expanduser(f"~/VLM/results/{DATASET}/{TAG}")); OUT.mkdir(parents=True, exist_ok=True)
@@ -236,6 +238,34 @@ ax.set_xlabel("N (queries/month)"); ax.set_ylabel("TCO saving vs baseline (%)")
 ax.set_ylim(-20, 60); ax.grid(alpha=0.3); ax.legend(fontsize=8)
 ax.set_title(f"{TITLE} TCO saving (batch=1, {FRAME}f, H2D excl.)")
 fig.tight_layout(); fig.savefig(OUT / f"fig5_1_saving_batch1.png", dpi=150); plt.close(fig)
+
+# ===== Fig 5_0: TCO saving (%) at LONG retention R=1000 months (batch=1, H2D excl.) =====
+# At huge R the one-time store cost F is fully amortized; storage rent (x R) vs per-query
+# saving decides. KV (large bytes) pays heavy rent -> saving collapses; vt stays cheap.
+_R0, _ret0 = R, retention
+R, retention = 1000.0, 1000.0 * 30
+d = B[1]
+fig, ax = plt.subplots(figsize=(5.0, 3.6))
+for t in tier_names:
+    tier = tiers[t]
+    base = tco("baseline", tier, d, Np)
+    for var, c in [("vt_reuse", "#2ca02c"), ("kv_reuse", "#d62728")]:
+        pct = (base - tco(var, tier, d, Np)) / base * 100.0
+        lab = var + (f" ({t})" if len(tier_names) > 1 else "")
+        ax.plot(Np, pct, color=c, label=lab, lw=1.8)
+ax.axhline(0, color="k", ls=":", lw=0.8)
+ax.set_xlabel("N (queries/month)"); ax.set_ylabel("TCO saving vs baseline (%)")
+ax.set_ylim(-20, 60); ax.grid(alpha=0.3); ax.legend(fontsize=8)
+ax.set_title(f"{TITLE} TCO saving (batch=1, {FRAME}f, R=1000mo)")
+fig.tight_layout(); fig.savefig(OUT / f"fig5_0_saving_R1000.png", dpi=150); plt.close(fig)
+print(f"\n=== Fig5_0 saving %% at R=1000mo (batch=1, S3, H2D excl.), N in {{1,10,60}} ===")
+for t in tier_names:
+    tier = tiers[t]
+    for var in ("vt_reuse", "kv_reuse"):
+        vals_pct = [(tco("baseline", tier, d, n) - tco(var, tier, d, n)) / tco("baseline", tier, d, n) * 100
+                    for n in (1.0, 10.0, 60.0)]
+        print(f"  {t:<16}{var:<10}" + "".join(f"N={n:>3.0f}:{v:>6.1f}%  " for n, v in zip((1, 10, 60), vals_pct)))
+R, retention = _R0, _ret0
 
 # ===== Fig 5_2: TCO saving (%) WITH retrieval cost (storage->DRAM + H2D), grid batch x tier =====
 fig, axes = plt.subplots(len(BL), len(tier_names), figsize=(4.0*len(tier_names), 3.0*len(BL)),

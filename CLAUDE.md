@@ -87,6 +87,12 @@ in the already-active env.
   splitting `T_encode` out of prefill (vLLM fuses stages via continuous batching
   + chunked prefill). Do not reach for transformers when vLLM can already give
   the number. See Section 5 for the exact split.
+- **⚠️ vLLM IS LOCALLY PATCHED (2026-06-05):** `model_executor/models/llava_onevision.py`
+  has an ADDED `video_embeds` injection path (for LLaVA-OV vt_reuse — see Section 3 LLaVA
+  quirks). Backup: `llava_onevision.py.bak_videoembeds`; reproducible diff:
+  `patches/llava_onevision_videoembeds.patch`. **If the env/vLLM is ever reinstalled, RE-APPLY
+  this patch** or LLaVA vt_reuse breaks. Other models/files are stock vLLM. This is the only
+  source-level vLLM edit; don't touch CUDA/torch/kernels (Section 2 rules still hold).
 - vLLM multimodal prefix caching is enabled by default in V1 and is hash-keyed on
   image content, so the same (video+query) hits cache on the 2nd request —
   REMEMBER to disable it (`enable_prefix_caching=False`) when measuring the
@@ -166,14 +172,21 @@ stage_timing_vllm.py):**
   Qwen, `with_metadata=False`); ctx token `video_token_index=151647`. **196 tok/frame FIXED**
   (bilinear-pooled SigLIP, resolution-independent → clean n_vis ∝ n_frame, like InternVL).
   NO pixel cap (max/min_pixels are Qwen-only — would error on the LLaVA processor).
-  `max_model_len=32768` (Qwen2 ceiling; 128f=25088 tok fits). **vt_reuse via IMAGE-embeds**:
-  vLLM's LLaVA *video* path ignores `video_embeds` (only `pixel_values_videos`), but the
-  *image* path accepts `image_embeds` (`_process_image_input` returns them as-is, skipping
-  encode). So inject by reusing the cold prompt and swapping `video_token→image_token_index
-  (151646)` + `{"image": (1,n_vis,H)}` → n_vis & prompt length match cold exactly.
-  ⚠️ **OPEN: on Blackwell (GPU0) the image-embeds inject TTFT > cold_ttft** (vt 402 vs cold
-  331ms @16f, persists with warmup) — the embeds-merge path has a fixed overhead. Must
-  re-check on H100; if it persists, the LLaVA vt injection method needs revisiting.
+  `max_model_len=32768` (Qwen2 ceiling; 128f=25088 tok fits).
+  **vt_reuse via VIDEO-embeds (PATCHED vLLM, RESOLVED 2026-06-05):** the original IMAGE-embeds
+  workaround was WRONG — LLaVA's image path expands placeholders into a 2D spatial grid with a
+  per-row `image_newline`, so injecting a flat video as one image DOUBLED the prefill sequence
+  (12557→25101 @64f) → fake "super-linear inject overhead", vt LOSES. Root cause confirmed via
+  profiler (gemm 2×, attn 4× = seq doubled) + prompt_len. FIX: vLLM's LLaVA *video* path had no
+  video_embeds branch, so we ADDED one to `llava_onevision.py` (schema `LlavaOnevisionVideoEmbeddingInputs`
+  + `_parse_and_validate_video_input` + `_get_mm_fields_config` + `embed_multimodal`; ~20 lines;
+  backup `*.bak_videoembeds`; jylim-only env, no other-model/user impact). Inject = RAW prompt
+  (single `<video>` placeholder) + `{"video": (1,n_vis,H)}`; vLLM expands to n_vis FLAT tokens
+  (video path adds only 1 newline, not per-row). Result: **vt < cold at ALL frames**, encode
+  saving ∝ n_vis (H100: 16f −122, 32f −255, 64f −444, 128f −988ms) — now matches InternVL/Qwen.
+  **128f works** with `--max-num-batched-tokens 32768` (encoder-cache budget = batched-tokens;
+  default 16384 < 25088 vision tokens → ValueError; raise to 32768). So LLaVA runs FULL-range
+  16–128f like InternVL. kv_reuse was always fine (warm 26–92ms).
 - **Cache discipline differs by script**: `reuse_real.py` runs `enable_prefix_caching=True`
   + `mm_processor_cache_gb=8` (needed for kv_reuse warm) and `reset()`s before every cold
   gen; `stage_timing_vllm.py` runs both caches OFF (batch=1 isolated, no contamination).
@@ -270,9 +283,10 @@ controlling vLLM's TWO reuse caches:
     4.5% @64f). Build vt_reuse AFTER cold/kv so a construction failure (Qwen3's
     vLLM video-embeds path still raises KeyError:'timestamps') loses ONLY
     vt_reuse, not baseline+kv.
-  - LLaVA-OV: also IMAGE-embeds (its video path ignores embeds). Reuse the cold prompt,
-    swap `video_token→image_token_index`, inject `{"image": (1, n_vis, H)}` → n_vis &
-    prompt length match cold exactly. ⚠️ inject TTFT > cold on Blackwell — re-verify on H100.
+  - LLaVA-OV: VIDEO-embeds via PATCHED vLLM (see Section 3 LLaVA quirks). RAW prompt (single
+    `<video>`) + `{"video": (1, n_vis, H)}` → vLLM expands to n_vis FLAT tokens. (The earlier
+    image-embeds workaround doubled the seq via per-row image_newline → reverted.) Run with
+    `--max-num-batched-tokens 32768` for 128f. vt < cold at all frames; matches InternVL/Qwen.
 - **DRAM→GPU H2D** (`h2d_tok`, `h2d_kv`) = the real retrieval hop, measured with
   cuda events. storage→DRAM is COMPUTED per tier (Section 7), not measured.
 
@@ -457,7 +471,9 @@ measure/
   byte_sizes.py        # computes read_bytes (token + KV) from config (no GPU) — feeds network_cost
   frames.py            # frame sampling helpers (linspace frame-count; Qwen-native fps)
   reuse_real.py        # ***PRIMARY*** integrated: cold/kv_reuse/vt_reuse x BATCH x cudagraph;
-                       #   TTFT/TPOT/throughput + H2D; vLLM cache control; Qwen max_pixels cap
+                       #   TTFT/TPOT/throughput + H2D; vLLM cache control; Qwen max_pixels cap.
+                       #   --vt-mode {inject(default)|mmhit}; --max-num-batched-tokens (LLaVA 128f=32768);
+                       #   LLaVA vt=video-embeds(raw <video>), Qwen vt=video_embeds+grid(+ts for qwen3)
   stage_timing_vllm.py # SECONDARY (vLLM): batch=1 ttft/decode + --text-baseline split (cross-check)
   stage_timing.py      # SECONDARY (transformers): true VRAM + cuda-event stages (cross-check)
   throughput.py        # DEPRECATED (baseline-only batch sweep; subsumed by reuse_real)
@@ -477,7 +493,8 @@ analyze/
                        #   fig3/5 use s3_same_region only; fig8 shows both tiers.
   plots.py             # primitives CSV + config -> break_even/cost_share figs (x=n_vis)
 scripts/run_full.sh    # orchestrator (per-(model,dataset) process, freeze watchdog, EngineCore reap)
-        run_qwen25_2pass.sh / run_intern_4b_14b.sh / run_llava.sh  # per-model 2-pass launchers
+        run_qwen25_2pass.sh / run_intern_4b_14b.sh / run_llava_ve.sh  # per-model launchers
+                       #   (run_llava_ve.sh = LLaVA video-embeds, 1 video, 16-128f, batched-tokens 32768)
 results/{dataset}/{model_tag}/   # CSV per dataset (reuse_real.csv) + per-model figures (append-only)
         nextqa_blackwell/         # ISOLATED GPU0/Blackwell prelim — never mixed with H100 data
 ```
@@ -496,18 +513,22 @@ Env + models + datasets all READY; byte_sizes sanity-check done. Pipeline:
 3. **ANALYZE (PRIMARY): `analyze/breakeven_reuse.py`** — N* over tier × gpu-stall × egress
    (e.g. `--models internvl3.5-8b --no-gpu-stall`).
 
-STATUS: **InternVL** (4B/8B/14B) is the validated path (NExT-QA + MLVU; 256 tok/frame
-fixed → clean fairness). **Qwen2.5** works (MLVU needs the max_pixels cap; figures done
-@64f). **LLaVA-OV-7B** integrated & functionally validated (196 tok/frame fixed, image-
-embeds vt path) — but its timing is still Blackwell-only (GPU0 prelim in
-`results/nextqa_blackwell/`); **H100 re-run pending** + the vt>cold inversion to confirm
-(Section 3 LLaVA quirks). **Qwen3-VL: cold/kv work, vt_reuse blocked by a vLLM video-embeds
-`timestamps` bug — UNRESOLVED.**
+STATUS: **InternVL** (4B/8B/14B) validated (NExT-QA + MLVU; 256 tok/frame fixed). **Qwen2.5**
+works (MLVU needs max_pixels cap). **LLaVA-OV-7B** RESOLVED on H100 (2026-06-05): vt_reuse via
+**video-embeds (patched vLLM)** — full-range 16/32/64/**128**f, vt < cold at all frames
+(−122/−255/−444/−988ms), matches InternVL/Qwen. Single video sufficient (encode latency is
+video-length-independent at fixed frame count). All 5 models now live in ONE CSV
+`results/nextqa/reuse_real.csv` (LLaVA = 540 rows video-embeds; old image-embeds artifact
+purged). Figures in `results/nextqa/{model}/`. **Qwen3-VL: video-embeds inject now RUNS** with
+timestamps(nested `[[...]]`, len==grid_thw[0]) + DeepStack embeds dim `HID*(1+3)=16384`
+(deepstack_visual_indexes=[8,16,24]) — but cold/vt n_vis MISMATCH (Qwen3 spatial-merges video:
+cold counts raw 1760 vs vt merged 440) so fair comparison needs n_vis reconciliation → DEFERRED.
 
-Active: InternVL-4B/14B × NExT-QA on GPU1 (run_intern_4b_14b.sh); LLaVA Blackwell prelim
-on GPU0 (isolated CSV). NEXT: once GPU1 frees, run `CUDA_VISIBLE_DEVICES=1
-scripts/run_llava.sh` for the H100-normalized LLaVA numbers, then
-`python analyze/fig_internvl8b.py --model llava-ov-7b --frame 64`.
+vLLM PATCH (jylim env only, backup kept): `llava_onevision.py` gained a video_embeds path.
+Final numbers come from this patched vLLM; revert via `*.bak_videoembeds` if needed.
 
-Before any GPU run: confirm H100 (GPU 1) idle (shared w/ `ljh`), `CUDA_VISIBLE_DEVICES=1`,
+Re-run LLaVA: `CUDA_VISIBLE_DEVICES=1 scripts/run_llava_ve.sh` (1 video, 16–128f, video-embeds,
+--max-num-batched-tokens 32768) → `fig_internvl8b.py --model llava-ov-7b --dataset nextqa --frame 128`.
+
+Before any GPU run: confirm H100 (GPU 1) idle (shared w/ `ljh`,`chani227`), `CUDA_VISIBLE_DEVICES=1`,
 `conda activate vlmcost`. After a vLLM job: reap the orphan `VLLM::EngineCore` (Section 2).

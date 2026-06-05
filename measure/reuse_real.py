@@ -66,6 +66,14 @@ def main() -> None:
                     help="Qwen only: VIDEO_MAX_PIXELS = N*28*28 (Qwen-native 768).")
     ap.add_argument("--video-min-patches", type=int, default=128)
     ap.add_argument("--cudagraph", action="store_true")
+    ap.add_argument("--max-num-batched-tokens", dest="max_num_batched_tokens", type=int, default=None,
+                    help="vLLM chunked-prefill batch / encoder-cache budget. Raise to 32768 for LLaVA "
+                         "128f (25k vision tokens > default 16384 -> encoder-budget ValueError otherwise).")
+    ap.add_argument("--vt-mode", dest="vt_mode", choices=["inject", "mmhit"], default="inject",
+                    help="vt_reuse front: inject=precomputed-embeds injection (real-impl cost; "
+                         "uses image/video-embeds path); mmhit=mm-processor-cache hit (encode-skip "
+                         "lower bound, no inject overhead; also bypasses the embeds-path quirks "
+                         "e.g. Qwen3 'timestamps', LLaVA super-linear inject overhead).")
     a = ap.parse_args()
 
     # H100(GPU1) is the default; ALLOW_GPU0=1 permits GPU0 (Blackwell) for FUNCTIONAL
@@ -109,14 +117,16 @@ def main() -> None:
     # cold_vt pass: prefix OFF + mm OFF (so B identical copies each prefill; no dedup).
     # kv pass: prefix ON + mm ON (populate once -> all B hit shared KV; warm skips enc+pre).
     cold_vt = a.pass_ == "cold_vt"
+    vt_mmhit = a.vt_mode == "mmhit"   # encode-skip via mm-cache hit instead of embeds injection
     mm_kwargs = None if (is_internvl or is_llava) else {
         "max_pixels": a.video_max_patches * 28 * 28, "min_pixels": a.video_min_patches * 28 * 28}
     print(f"[reuse_real] pass={a.pass_} loading {spec.repo_id} "
           f"(prefix={'OFF' if cold_vt else 'ON'}, cudagraph={a.cudagraph}, batches={a.batches}) ...", flush=True)
     llm = LLM(model=spec.repo_id, trust_remote_code=spec.trust_remote_code,
               max_model_len=a.max_model_len, gpu_memory_utilization=0.85, enforce_eager=not a.cudagraph,
-              max_num_seqs=max(a.batches),
-              enable_prefix_caching=not cold_vt, mm_processor_cache_gb=(0 if cold_vt else 8),
+              max_num_seqs=max(a.batches), max_num_batched_tokens=a.max_num_batched_tokens,
+              enable_prefix_caching=not cold_vt,
+              mm_processor_cache_gb=(8 if (not cold_vt or vt_mmhit) else 0),
               enable_mm_embeds=True, mm_processor_kwargs=mm_kwargs,
               limit_mm_per_prompt={"video": 1, "image": 1})
     HID = spec.hidden_size
@@ -179,29 +189,49 @@ def main() -> None:
             emit(vid, nf, B, "cold", "ttft", c_ttft, n_vis, n_prompt, tb, kb, dur)
             emit(vid, nf, B, "cold", "full", c_full, n_vis, n_prompt, tb, kb, dur)
             emit(vid, nf, B, "cold", "prefill_textbase", c_pre, n_vis, n_prompt, tb, kb, dur)
-            # vt_reuse: B identical embeds (same video -> same n_vis -> split matches)
-            if is_internvl:
-                ip = tok.apply_chat_template([{"role": "user", "content": "<image>\n" + query}],
-                                             tokenize=False, add_generation_prompt=True)
-                er = {"prompt": ip, "multi_modal_data": {"image": torch.randn(1, n_vis, HID, dtype=torch.bfloat16)}}
-            elif is_llava:  # reuse cold prompt 1:1, swap video placeholder -> image placeholder, inject image_embeds
-                ids = [img_tid if t == vtid else t for t in o.prompt_token_ids]
-                er = {"prompt_token_ids": ids,
-                      "multi_modal_data": {"image": torch.randn(1, n_vis, HID, dtype=torch.bfloat16)}}
+            # vt_reuse front: either embeds-injection (real impl cost) or mm-cache hit (encode-skip lower bound)
+            if vt_mmhit:
+                # encode once into the mm cache (prefix OFF -> prefill NOT cached), then re-run:
+                # subsequent gens hit the mm cache (encode skipped) but re-run prefill -> pure encode-skip prefill.
+                reset(); gen(reqs, spD)                 # populate mm cache (B copies share one encode)
+                for _ in range(a.warmup):
+                    gen(reqs, sp1)                      # mm-hit (NO reset, keep encoder cache)
+                t_ttft, t_full = [], []
+                for _ in range(a.runs):
+                    w1, _ = gen(reqs, sp1); t_ttft.append(w1 / B)
+                    wf, _ = gen(reqs, spD); t_full.append(wf / B)
             else:
-                _v = req["multi_modal_data"]["video"]; _f = _v[0] if isinstance(_v, tuple) else _v
-                _raw = proc(text=[req["prompt"]], videos=[_f], return_tensors="pt")
-                er = {"prompt": req["prompt"], "multi_modal_data": {"video": {
-                    "video_embeds": torch.randn(n_vis, HID, dtype=torch.bfloat16),
-                    "video_grid_thw": _raw["video_grid_thw"]}}}
-            ereqs = [er] * B
-            for _ in range(a.warmup):
-                reset(); gen(ereqs, sp1)
-            t_ttft, t_full = [], []
-            for _ in range(a.runs):
-                reset(); w1, _ = gen(ereqs, sp1)
-                reset(); wf, _ = gen(ereqs, spD)
-                t_ttft.append(w1 / B); t_full.append(wf / B)
+                # B identical embeds (same video -> same n_vis -> split matches)
+                if is_internvl:
+                    ip = tok.apply_chat_template([{"role": "user", "content": "<image>\n" + query}],
+                                                 tokenize=False, add_generation_prompt=True)
+                    er = {"prompt": ip, "multi_modal_data": {"image": torch.randn(1, n_vis, HID, dtype=torch.bfloat16)}}
+                elif is_llava:  # VIDEO-embeds path (patched vLLM llava_onevision): raw prompt with a
+                    # single <video> placeholder -> vLLM expands to n_vis FLAT tokens (no image_newline
+                    # explosion). image-embeds path doubled the seq via spatial newlines; video path is flat.
+                    raw = proc.apply_chat_template(
+                        [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": query}]}],
+                        add_generation_prompt=True, tokenize=False)
+                    er = {"prompt": raw,
+                          "multi_modal_data": {"video": torch.randn(1, n_vis, HID, dtype=torch.bfloat16)}}
+                else:
+                    _v = req["multi_modal_data"]["video"]; _f = _v[0] if isinstance(_v, tuple) else _v
+                    _raw = proc(text=[req["prompt"]], videos=[_f], return_tensors="pt")
+                    _vmm = {"video_embeds": torch.randn(n_vis, HID, dtype=torch.bfloat16),
+                            "video_grid_thw": _raw["video_grid_thw"]}
+                    if needs_meta:  # Qwen3: video_embeds path needs per-frame timestamps
+                        # (placeholder build + temporal RoPE). len must == grid_thw[0] (temporal dim).
+                        _t = int(_raw["video_grid_thw"][0][0])
+                        _vmm["timestamps"] = [float(i) for i in range(_t)]
+                    er = {"prompt": req["prompt"], "multi_modal_data": {"video": _vmm}}
+                ereqs = [er] * B
+                for _ in range(a.warmup):
+                    reset(); gen(ereqs, sp1)
+                t_ttft, t_full = [], []
+                for _ in range(a.runs):
+                    reset(); w1, _ = gen(ereqs, sp1)
+                    reset(); wf, _ = gen(ereqs, spD)
+                    t_ttft.append(w1 / B); t_full.append(wf / B)
             emit(vid, nf, B, "vt_reuse", "ttft_inject", t_ttft, n_vis, n_prompt, tb, kb, dur)
             emit(vid, nf, B, "vt_reuse", "full_inject", t_full, n_vis, n_prompt, tb, kb, dur)
             emit(vid, nf, B, "vt_reuse", "h2d_tok", [h2d_ms(tb) for _ in range(a.runs)], n_vis, n_prompt, tb, kb, dur)

@@ -1,0 +1,60 @@
+--- /home/jylim/miniforge3/envs/vlmcost/lib/python3.11/site-packages/vllm/model_executor/models/llava_onevision.py.bak_videoembeds	2026-06-05 04:43:45.686125874 +0000
++++ /home/jylim/miniforge3/envs/vlmcost/lib/python3.11/site-packages/vllm/model_executor/models/llava_onevision.py	2026-06-05 05:07:28.657024531 +0000
+@@ -74,6 +74,17 @@
+     ]
+ 
+ 
++class LlavaOnevisionVideoEmbeddingInputs(TensorSchema):
++    """Precomputed video embeddings (encode-skip reuse). Dims: bn, ifs, hs."""
++
++    type: Literal["video_embeds"] = "video_embeds"
++
++    data: Annotated[
++        torch.Tensor | list[torch.Tensor],
++        TensorShape("bn", "ifs", "hs"),
++    ]
++
++
+ class LlavaOnevisionImagePixelInputs(TensorSchema):
+     """
+     Dimensions:
+@@ -319,6 +330,7 @@
+             image_sizes=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
+             image_embeds=MultiModalFieldConfig.batched("image"),
+             pixel_values_videos=MultiModalFieldConfig.batched("video"),
++            video_embeds=MultiModalFieldConfig.batched("video"),
+         )
+ 
+     def _call_hf_processor(
+@@ -572,9 +584,16 @@
+         }
+         """
+         pixel_values_videos = kwargs.pop("pixel_values_videos", None)
+-        if pixel_values_videos is None:
++        video_embeds = kwargs.pop("video_embeds", None)
++        if pixel_values_videos is None and video_embeds is None:
+             return None
+ 
++        if video_embeds is not None:
++            return LlavaOnevisionVideoEmbeddingInputs(
++                type="video_embeds",
++                data=video_embeds,
++            )
++
+         return LlavaOnevisionVideoPixelInputs(
+             type="pixel_values_videos",
+             pixel_values_videos=pixel_values_videos,
+@@ -879,7 +898,12 @@
+                 image_embeddings = self._process_image_input(multimodal_input)
+                 multimodal_embeddings += tuple(image_embeddings)
+             if modality == "video":
+-                video_embeddings = self._process_video_pixels(multimodal_input)
++                if multimodal_input["type"] == "video_embeds":
++                    # precomputed video embeds (encode-skip reuse); tuple() unbinds
++                    # (bn, ifs, hs) -> bn x (ifs, hs) 2D tensors, like the image path
++                    video_embeddings = multimodal_input["data"]
++                else:
++                    video_embeddings = self._process_video_pixels(multimodal_input)
+                 multimodal_embeddings += tuple(video_embeddings)
+ 
+         return multimodal_embeddings

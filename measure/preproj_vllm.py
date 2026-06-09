@@ -30,6 +30,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import load_models                                  # noqa: E402
 
 _FIRED = {"n": 0}
+_PIN = {"buf": None}
+
+
+def _h2d(shape, dtype, dev):
+    """Simulate loading the cached vision tensor from DRAM -> GPU: a pinned-CPU buffer (grown once
+    per process to the max shape; realloc absorbed by warmup) transferred to GPU each call. The
+    blocking .to(dev) IS the REAL DRAM->GPU H2D, included in the timed generate — so vt_reuse TTFT
+    accounts for retrieval just like LMCache kv/EC (which also load DRAM->GPU). bytes = pre: encoder
+    output (pre-projector); post: post-projector tokens."""
+    import torch
+    n = 1
+    for s in shape:
+        n *= int(s)
+    b = _PIN["buf"]
+    if b is None or b.numel() < n or b.dtype != dtype:
+        _PIN["buf"] = torch.randn(n, dtype=dtype, pin_memory=True); b = _PIN["buf"]
+    return b[:n].view(*shape).to(dev)   # blocking H2D (serial, like LMCache load)
 
 
 def _diag(mode, self, shape):
@@ -55,8 +72,8 @@ def patch_internvl():
         npatch = (vc.image_size // vc.patch_size) ** 2
         if mode == "post":
             ntok = int(npatch * (self.downsample_ratio ** 2))
-            return torch.randn(nt, ntok, H, device=dev, dtype=dt)
-        v = torch.randn(nt, npatch + 1, vc.hidden_size, device=dev, dtype=dt)[:, 1:, :]
+            return _h2d((nt, ntok, H), dt, dev)                         # load post-projector tokens
+        v = _h2d((nt, npatch + 1, vc.hidden_size), dt, dev)[:, 1:, :]   # load ViT (encoder) output
         h = w = int(v.shape[1] ** 0.5)
         v = v.reshape(v.shape[0], h, w, -1)
         v = self.pixel_shuffle(v, scale_factor=self.downsample_ratio)
@@ -84,8 +101,8 @@ def patch_llava():
         grid = vc.image_size // vc.patch_size
         if mode == "post":
             pooled = math.ceil(grid / 2) ** 2                 # apply_pooling stride 2
-            return torch.randn(nf, pooled, H, device=dev, dtype=dt)
-        feats = torch.randn(nf, grid * grid, vc.hidden_size, device=dev, dtype=dt)  # ViT output
+            return _h2d((nf, pooled, H), dt, dev)             # load post-projector tokens
+        feats = _h2d((nf, grid * grid, vc.hidden_size), dt, dev)  # load ViT (encoder) output
         feats = self.multi_modal_projector(feats)
         feats = self.apply_pooling(feats)
         return feats
@@ -109,10 +126,10 @@ def patch_qwen25():
         dev, dt = self.device, self.dtype
         if mode == "post":                                             # skip blocks + merger
             dmodel = self.merger.mlp[-1].output_size                   # d_model (3584; RowParallelLinear)
-            return torch.randn(seq_len // smu, dmodel, device=dev, dtype=dt)
+            return _h2d((seq_len // smu, dmodel), dt, dev)             # load post-projector tokens
         ctx = self.merger.ln_q.weight.shape[0]                          # context_dim (1280; RMSNorm)
         meta = encoder_metadata or self.prepare_encoder_metadata(grid_thw)  # reverse_indices
-        hs = torch.randn(seq_len, 1, ctx, device=dev, dtype=dt)        # "cached" block (encoder) output
+        hs = _h2d((seq_len, 1, ctx), dt, dev)                          # load block (encoder) output
         hs = self.merger(hs)                                          # run merger (projector)
         return hs[meta["reverse_indices"], :]
     cls.forward = patched

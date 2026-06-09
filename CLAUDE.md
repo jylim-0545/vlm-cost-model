@@ -725,6 +725,14 @@ EngineCore between vLLM runs; warns on other-user GPU use; per-config OOM/overfl
 
 **Measurement tier = DRAM** (real DRAM→GPU load, ~42–52 GB/s measured). storage→DRAM (S3 / local) is
 COMPUTED in TCO (§7). **TCO knobs (per §11): encoder-output bytes for vt, GPU-stall OFF, S3-only.**
+
+**⚠️ vt H2D consistency (2026-06-09):** kv (LMCache) and Qwen3-EC vt INCLUDE the real DRAM→GPU load in
+their TTFT (LMCache loads from CPU-DRAM). To match, preproj `_h2d()` now loads the "cached" vision
+tensor from a **pinned CPU buffer → `.to(GPU)` (blocking)** inside the timed generate (pre = ViT/encoder
+output bytes; post = post-projector bytes), instead of synthesizing on-GPU. So all 3 variants' TTFT
+include real DRAM→GPU retrieval. **Impact MEASURED ≈ negligible / within run-to-run noise** (InternVL b1
+vt: 16f 258→262, 128f 3143→3164 ms) — vision-token bytes are small (128f InternVL ≈268MB → ~5ms @50GB/s),
+buried in prefill-bound TTFT. So rigor is preserved; conclusions (vt≈prefill, break-even) unchanged.
 **decode_tokens = 256** (preproj cold `full`; decode is variant-independent so vt/kv full = their ttft +
 (cold_full − cold_ttft)). Long-format CSVs keyed by (model,dataset,video_id,res_label,frames,batch,n_vis,
 variant,metric).

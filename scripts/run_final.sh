@@ -48,7 +48,7 @@ done
 echo "==================== qwen3-vl-8b : vt_reuse via EC (post-projector) ===================="
 check_gpu
 python -m measure.reuse_lmcache --model qwen3-vl-8b --videos-csv "$VIDS" --frames $FR --batches $BA \
-    --mode ec --tier dram --csv "$OUT/reuse_ec.csv" 2>"$OUT/log_ec_qwen3.err"
+    --mode ec --csv "$OUT/reuse_ec.csv" 2>"$OUT/log_ec_qwen3.err"
 reap
 
 echo "[done] results/final/  (cold/vt in preproj_vllm.csv, kv in reuse_lmcache.csv, qwen3 vt in reuse_ec.csv)"

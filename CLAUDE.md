@@ -670,6 +670,13 @@ The measurement pivoted to a **3-way comparison, ALL real-measured in vLLM TTFT*
 
 ### vt_reuse EC (encoder cache) — what vLLM vs LMCache provide
 vLLM ships the EC FRAMEWORK (`vllm.distributed.ec_transfer`: ECConnectorBase + ECExampleConnector[disk toy] + factory) in 0.22/main. LMCache adds the production EC backend (`lmcache...vllm_ec_adapter.LMCacheECConnectorImpl` + `ECCacheEngine`, tiered). The vLLM-side bridge `LMCacheECConnector` is in **UNMERGED vLLM PR #38668** → vendored into OUR repo at `measure/lmcache_ec_connector.py`, pointed to via `ec_connector_module_path="measure.lmcache_ec_connector"` (factory falls back to it for unregistered names → **NO vLLM source edit**; needs PYTHONPATH=repo for the worker). EC caches the POST-projector tower output keyed by vLLM **mm_hash**. **CRITICAL: do NOT set `mm_processor_cache_gb=0` for EC** — that yields positional mm_hash (`renderer0-mm-N`) → never hits; default mm cache gives a content hash → warm hits & skips the tower. Qwen3 EC verified: warm≪cold (16/32/64f: 77/149/318 vs 210/508/1097ms), `EC put` stores n_vis×16384(DeepStack)×2 bytes.
+- **⚠️ FINAL CHOICE (2026-06-09): vt_reuse uses vLLM's BUILT-IN `ECExampleConnector`, NOT LMCache's EC.**
+  Rule: **vt_reuse = vLLM only** (pre-projector monkeypatch for InternVL/LLaVA/Qwen2.5; ECExampleConnector
+  for Qwen3); **LMCache = kv_reuse ONLY.** LMCache EC was just exploration/validation. ECExampleConnector
+  (vLLM-native, registered in the EC factory) caches the tower output to a local dir (`shared_storage_path`,
+  page-cached→DRAM-ish) keyed by content mm_hash — verified Qwen3 vt≈LMCache-EC (16f 80.5 vs 80.1ms; matches).
+  No PYTHONPATH/connector-module needed (it ships in vLLM). `measure/lmcache_ec_connector.py` retained for the
+  record but NOT used in the final run.
 
 ### vt_reuse PRE-projector — `measure/preproj_vllm.py` (REAL vLLM, NO source edit)
 Run engine **IN-PROCESS** (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) so a main-process monkeypatch reaches the model, + **`mm_processor_cache_gb=0`** so vision REALLY re-runs each generate (opposite of EC! else the repeat hits the in-engine mm cache → all modes look identical). Per-model monkeypatch on the encoder→projector split, branched by env `VLM_REUSE_MODE`:
@@ -717,8 +724,10 @@ EngineCore between vLLM runs; warns on other-user GPU use; per-config OOM/overfl
   + vt_pre/vt_post ttft. n_vis counted from real prompt tokens. `--csv results/final/preproj_vllm.csv`.
 - **kv_reuse (all 4)** → `reuse_lmcache.py --mode lmcache --tier dram` (real KV LOAD; prefix OFF).
   `results/final/reuse_lmcache.csv`.
-- **vt_reuse (Qwen3)** → `reuse_lmcache.py --mode ec --tier dram` (EC post-projector; mm cache ON for
-  content-hash). `results/final/reuse_ec.csv`.
+- **vt_reuse (Qwen3)** → `reuse_lmcache.py --mode ec` = **vLLM's BUILT-IN `ECExampleConnector`** (post-
+  projector; NOT LMCache — LMCache is kv-only). Caches the vision-tower output to a local dir keyed by
+  content mm_hash (mm cache ON); warm skips the tower. `results/final/reuse_ec.csv`. (vt_reuse = vLLM
+  entirely: monkeypatch for the 3 patchable models + ECExampleConnector for Qwen3.)
 
 **cold source = preproj_vllm** (NOT reuse_real) — real full recompute, validated (InternVL 308 / Qwen2.5
 670@720 ms @16f), same engine as vt for the 3 patchable models → clean cold−vt saving.

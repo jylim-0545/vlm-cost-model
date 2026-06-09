@@ -53,8 +53,9 @@ def main() -> None:
     ap.add_argument("--videos-csv", default="final_videos.csv")
     ap.add_argument("--frames", type=int, nargs="+", default=[16, 32, 64, 128])
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 4, 8, 16])
-    ap.add_argument("--mode", choices=["lmcache", "ec"], default="lmcache")
-    ap.add_argument("--tier", choices=["dram", "disk"], required=True)
+    ap.add_argument("--mode", choices=["lmcache", "ec"], default="lmcache",
+                    help="lmcache=LMCache KV reuse; ec=vLLM built-in ECExampleConnector (vt_reuse, NOT LMCache)")
+    ap.add_argument("--tier", choices=["dram", "disk"], help="required for --mode lmcache (kv)")
     ap.add_argument("--disk-path", default=os.path.expanduser("~/VLM/scratch/lmcache_disk"))
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=2)
@@ -72,8 +73,19 @@ def main() -> None:
            "qwen2.5" if spec.key.startswith("qwen2.5") else
            "qwen3" if spec.key.startswith("qwen3") else None)
     assert fam, f"unknown family for {spec.key}"
-    # EC mode keeps content-hash mm cache ON (positional hash never hits); KV mode forces tier load.
-    cfg = configure_tier(a.tier, a.disk_path)
+    # KV (lmcache) -> LMCache tier (forces real DRAM->GPU load; prefix OFF). EC (vt_reuse) -> vLLM's
+    # BUILT-IN ECExampleConnector, NOT LMCache (LMCache is kv-only); caches encoder output to a local
+    # dir (page-cached -> DRAM-ish) keyed by content mm_hash (mm cache ON so it hits).
+    ec_store = os.path.expanduser("~/VLM/scratch/ec_store")
+    if a.mode == "lmcache":
+        if not a.tier:
+            ap.error("--tier is required for --mode lmcache")
+        cfg = configure_tier(a.tier, a.disk_path)
+    else:
+        import shutil
+        shutil.rmtree(ec_store, ignore_errors=True)
+        Path(ec_store).mkdir(parents=True, exist_ok=True)
+        cfg = {"ec_store": ec_store}
 
     import torch
     from vllm import LLM, SamplingParams
@@ -118,14 +130,14 @@ def main() -> None:
                                kv_load_failure_policy="recompute")
         llm = LLM(enable_prefix_caching=False, kv_transfer_config=ktc, **common)
         warm_variant = "kv_reuse"
-    else:  # ec
-        etc = ECTransferConfig(ec_connector="LMCacheECConnector", ec_role="ec_both",
-                               ec_connector_module_path="measure.lmcache_ec_connector")
+    else:  # ec = vLLM's built-in encoder cache (ECExampleConnector). NOT LMCache.
+        etc = ECTransferConfig(ec_connector="ECExampleConnector", ec_role="ec_both",
+                               ec_connector_extra_config={"shared_storage_path": ec_store})
         llm = LLM(enable_prefix_caching=False, ec_transfer_config=etc, **common)
         warm_variant = "vt_reuse"
     sp = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
     import vllm as _vllm
-    lmver = __import__("lmcache").__version__
+    lmver = "none" if a.mode == "ec" else __import__("lmcache").__version__
 
     def med(reqs):
         B = len(reqs)

@@ -1,43 +1,40 @@
-"""LMCache kv_reuse measurement — the REAL KV-offload-and-retrieve path, to compare against
-our analytical kv_reuse (measure/reuse_real.py, vLLM 0.22 prefix-cache-warm + COMPUTED retrieval).
+"""LMCache reuse measurement — REAL kv_reuse (KV offload+reload) and EC vt_reuse (Qwen3).
 
-This measures, per (model, video, frames) on a storage TIER:
-  - cold      : first request for this (video,frames) key -> LMCache MISS -> recompute encode+prefill
-                (+ store KV to the tier). The within-engine baseline.
-  - kv_lmcache: subsequent request -> LMCache HIT -> KV LOADED BACK from the tier (real retrieval),
-                prefill skipped. This is LMCache's kv_reuse.
+Per (model, video, frames, batch) on a storage TIER:
+  - kv (--mode lmcache): LMCache KV connector. enable_prefix_caching=False forces a REAL tier
+    LOAD on the warm request (else GPU-resident hit). warm = kv_reuse (skip encode+prefill).
+  - ec (--mode ec): LMCache Encoder Cache (post-projector vt_reuse) — used for Qwen3 (DeepStack
+    makes pre-projector ill-defined). warm = vt_reuse (skip the vision tower). NOTE: do NOT set
+    mm_processor_cache_gb=0 for EC — that yields positional mm_hash and never hits.
 
-CRITICAL — force real retrieval: vLLM's own prefix cache is DISABLED (enable_prefix_caching=False)
-so KV is NOT GPU-resident across requests; the only reuse path is LMCache, which therefore must
-actually LOAD from the tier (DRAM / local disk). With prefix caching ON, the smoke test showed
-'need to load: 0' (served from GPU cache) — that would measure a GPU hit, not tier retrieval.
+cold (full recompute) is NOT measured here — it is the canonical `reuse_real.py` cold pass. We
+record a within-engine `cold_ref` (the store/miss pass) only for sanity.
 
-Runs in the isolated `lmcache` conda env (vLLM 0.18 / lmcache 0.4.4). H100 ONLY — LMCache's
-prebuilt c_ops has no Blackwell (sm_120) kernel. Writes results/lmcache/ (isolated; never touches
-results/nextqa/reuse_real.csv). ONE tier per process (LMCACHE_* env is read at engine init); use
-the launcher to sweep tiers.
+Runs in `vlmcost` (vLLM 0.22 + lmcache 0.4.6; c_ops loads). H100 ONLY (LMCache c_ops has no
+Blackwell kernel). EC connector lives in measure/lmcache_ec_connector.py -> need PYTHONPATH=repo.
+Writes results/final/ (isolated). ONE tier per process (LMCACHE_* read at engine init).
 """
 from __future__ import annotations
 import argparse
 import csv
 import os
 import statistics
+import sys
 import time
 from pathlib import Path
 
-import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import load_models                                    # noqa: E402
 
 
 def configure_tier(tier: str, disk_path: str) -> dict:
-    """Set LMCACHE_* env BEFORE vllm import. Returns a dict of the knobs (for logging)."""
     os.environ["LMCACHE_CHUNK_SIZE"] = "256"
-    if tier == "dram":                       # CPU-DRAM tier: large CPU pool, no disk
-        cfg = {"LMCACHE_LOCAL_CPU": "True", "LMCACHE_MAX_LOCAL_CPU_SIZE": "20.0"}
-    elif tier == "disk":                     # local-NVMe tier: tiny CPU pool forces spill to disk,
-        cfg = {"LMCACHE_LOCAL_CPU": "True",  # so reuse loads disk->CPU->GPU (real NVMe retrieval)
-               "LMCACHE_MAX_LOCAL_CPU_SIZE": "0.5",
-               "LMCACHE_LOCAL_DISK": f"file://{disk_path}",
-               "LMCACHE_MAX_LOCAL_DISK_SIZE": "80.0"}
+    if tier == "dram":
+        cfg = {"LMCACHE_LOCAL_CPU": "True", "LMCACHE_MAX_LOCAL_CPU_SIZE": "40.0"}
+    elif tier == "disk":
+        cfg = {"LMCACHE_LOCAL_CPU": "True", "LMCACHE_MAX_LOCAL_CPU_SIZE": "0.5",
+               "LMCACHE_USE_GDS": "False",   # GDS/cufile hangs on this FS; plain disk I/O
+               "LMCACHE_LOCAL_DISK": f"file://{disk_path}", "LMCACHE_MAX_LOCAL_DISK_SIZE": "120.0"}
         Path(disk_path).mkdir(parents=True, exist_ok=True)
     else:
         raise ValueError(f"unknown tier {tier!r}")
@@ -45,148 +42,142 @@ def configure_tier(tier: str, disk_path: str) -> dict:
     return cfg
 
 
-def assert_h100() -> None:
-    import torch
-    name = torch.cuda.get_device_name(0)
-    assert "H100" in name, (f"LMCache track is H100-only (its c_ops has no Blackwell kernel); "
-                            f"visible device is {name!r}. Set CUDA_VISIBLE_DEVICES=1.")
-    print(f"[gpu] OK pinned to {name}")
-
-
-def build_llava_video_request(processor, path: str, n_frames: int,
-                              query: str = "Describe this video in detail."):
-    import decord
-    decord.bridge.set_bridge("native")
-    vr = decord.VideoReader(path)
-    idx = np.linspace(0, len(vr) - 1, num=min(n_frames, len(vr))).round().astype(int)
-    frames = vr.get_batch(idx).asnumpy()
-    content = [{"type": "video"}, {"type": "text", "text": query}]
-    prompt = processor.apply_chat_template(
-        [{"role": "user", "content": content}], add_generation_prompt=True, tokenize=False)
-    return {"prompt": prompt, "multi_modal_data": {"video": frames}}, len(idx)
+def load_videos(path):
+    with open(path) as f:
+        return list(csv.DictReader(f))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="llava-hf/llava-onevision-qwen2-7b-ov-hf")
-    ap.add_argument("--model-tag", default="llava-ov-7b", help="tag written to CSV (match reuse_real)")
-    ap.add_argument("--video", default=os.path.expanduser("~/VLM/scratch/nextqa_videos/5396384503.mp4"))
+    ap.add_argument("--model", default="llava-ov-7b", help="model KEY (config/models.yaml)")
+    ap.add_argument("--videos-csv", default="final_videos.csv")
     ap.add_argument("--frames", type=int, nargs="+", default=[16, 32, 64, 128])
-    ap.add_argument("--mode", choices=["lmcache", "ours", "ec"], default="lmcache",
-                    help="lmcache=LMCache KV tier offload+load; ours=vanilla vLLM prefix-cache warm "
-                         "(GPU-resident KV); ec=LMCache Encoder Cache (vision-token reuse, encode-skip)")
-    ap.add_argument("--tier", choices=["dram", "disk"], help="required for --mode lmcache")
+    ap.add_argument("--batches", type=int, nargs="+", default=[1, 4, 8, 16])
+    ap.add_argument("--mode", choices=["lmcache", "ec"], default="lmcache")
+    ap.add_argument("--tier", choices=["dram", "disk"], required=True)
     ap.add_argument("--disk-path", default=os.path.expanduser("~/VLM/scratch/lmcache_disk"))
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=2)
-    ap.add_argument("--csv", default="results/lmcache/reuse_lmcache.csv")
+    ap.add_argument("--max-model-len", type=int, default=40960)
+    ap.add_argument("--max-num-batched-tokens", type=int, default=32768)
+    ap.add_argument("--video-max-patches", type=int, default=768)
+    ap.add_argument("--video-min-patches", type=int, default=128)
+    ap.add_argument("--qwen3-longest-edge", type=int, default=768 * 28 * 28 * 256)
+    ap.add_argument("--csv", default="results/final/reuse_lmcache.csv")
     a = ap.parse_args()
-    if a.mode in ("lmcache", "ec") and not a.tier:
-        ap.error(f"--tier is required for --mode {a.mode}")
 
-    # 'ours' = OUR kv_reuse (reuse_real mechanism): vanilla vLLM prefix-cache warm, NO LMCache,
-    #          KV stays GPU-RESIDENT across requests (no real tier retrieval). 'lmcache' = LMCache
-    #          offload to a storage tier + real LOAD-back. Same engine/model/video/frames otherwise
-    #          -> apples-to-apples head-to-head (the warm DELTA = real cost of going to a tier).
-    is_ours = a.mode == "ours"
-    is_ec = a.mode == "ec"
-    cfg = {} if is_ours else configure_tier(a.tier, a.disk_path)
-    tier_label = "gpu_resident" if is_ours else a.tier
-    warm_variant = {"ours": "kv_ours", "lmcache": "kv_lmcache", "ec": "ec_reuse"}[a.mode]
+    spec = load_models().models[a.model]
+    fam = ("internvl" if spec.key.startswith("internvl") else
+           "llava" if spec.key.startswith("llava") else
+           "qwen2.5" if spec.key.startswith("qwen2.5") else
+           "qwen3" if spec.key.startswith("qwen3") else None)
+    assert fam, f"unknown family for {spec.key}"
+    # EC mode keeps content-hash mm cache ON (positional hash never hits); KV mode forces tier load.
+    cfg = configure_tier(a.tier, a.disk_path)
 
     import torch
-    from transformers import AutoProcessor
     from vllm import LLM, SamplingParams
     from vllm.config import KVTransferConfig, ECTransferConfig
+    from transformers import AutoTokenizer, AutoProcessor, AutoConfig
+    from measure.stage_timing_vllm import build_video_request, build_video_request_internvl
 
-    assert_h100()
-    assert Path(a.video).exists(), f"video not found: {a.video}"
-    print(f"[mode] {a.mode}  tier={tier_label}  warm_variant={warm_variant}  cfg={cfg}")
+    name = torch.cuda.get_device_name(0)
+    assert "H100" in name, f"LMCache is H100-only (c_ops no sm_120 kernel); got {name!r}"
+    print(f"[gpu] {name}  [mode] {a.mode} [tier] {a.tier} [cfg] {cfg}")
 
-    proc = AutoProcessor.from_pretrained(a.model)
-    # max_num_batched_tokens=32768 raises the encoder-cache budget so 128f (25088 vis tok) fits.
-    common = dict(model=a.model, max_model_len=32768, enforce_eager=True,
-                  gpu_memory_utilization=0.85, limit_mm_per_prompt={"video": 1},
-                  max_num_batched_tokens=32768)
-    if is_ours:
-        # prefix caching ON -> 2nd identical request HITS the GPU-resident KV (= our kv_reuse).
-        llm = LLM(enable_prefix_caching=True, **common)
-    elif is_ec:
-        # LMCache ENCODER CACHE: cache the encoder output (vision tokens) to a tier; on mm_hash
-        # hit, reload it and SKIP the encoder. prefix caching OFF so prefill ALWAYS runs ->
-        # matches our vt_reuse semantics (encode-skip only). Connector lives in THIS repo
-        # (measure/lmcache_ec_connector.py); vLLM resolves it via ec_connector_module_path.
-        etc = ECTransferConfig(ec_connector="LMCacheECConnector", ec_role="ec_both",
-                               ec_connector_module_path="measure.lmcache_ec_connector")
-        llm = LLM(enable_prefix_caching=False, ec_transfer_config=etc, **common)
+    # ---- per-family request builder + n_vis token id + engine mm kwargs ----
+    needs_meta = fam == "qwen3"
+    is_qwen = fam in ("qwen2.5", "qwen3")
+    mm_kwargs = None
+    if fam == "qwen2.5":
+        mm_kwargs = {"max_pixels": a.video_max_patches * 28 * 28, "min_pixels": a.video_min_patches * 28 * 28}
+    elif fam == "qwen3":
+        mm_kwargs = {"size": {"longest_edge": a.qwen3_longest_edge, "shortest_edge": 4096}}
+
+    if fam == "internvl":
+        tok = AutoTokenizer.from_pretrained(spec.repo_id, trust_remote_code=True)
+        vtid = tok.convert_tokens_to_ids("<|video_pad|>")
+        make_req = lambda path, nf: build_video_request_internvl(tok, path, nf)[0]
     else:
-        # prefix caching OFF -> no GPU-resident reuse -> LMCache must LOAD KV from the tier.
+        vpx = {"max_pixels": a.video_max_patches * 28 * 28,
+               "min_pixels": a.video_min_patches * 28 * 28} if fam == "qwen2.5" else {}
+        proc = AutoProcessor.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code, **vpx)
+        if needs_meta and hasattr(proc, "video_processor"):
+            proc.video_processor.size.longest_edge = a.qwen3_longest_edge
+        cfg_ = AutoConfig.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
+        vtid = getattr(cfg_, "video_token_id", None) or getattr(cfg_, "video_token_index", None)
+        make_req = lambda path, nf: build_video_request(proc, path, n_frames=nf, with_metadata=needs_meta)[0]
+
+    mml = 32768 if fam == "llava" else a.max_model_len
+    common = dict(model=spec.repo_id, trust_remote_code=spec.trust_remote_code, max_model_len=mml,
+                  gpu_memory_utilization=0.85, enforce_eager=True, mm_processor_kwargs=mm_kwargs,
+                  max_num_seqs=max(a.batches), max_num_batched_tokens=a.max_num_batched_tokens,
+                  limit_mm_per_prompt={"video": 1})
+    if a.mode == "lmcache":
         ktc = KVTransferConfig(kv_connector="LMCacheConnectorV1", kv_role="kv_both",
                                kv_load_failure_policy="recompute")
         llm = LLM(enable_prefix_caching=False, kv_transfer_config=ktc, **common)
-    sp_ttft = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+        warm_variant = "kv_reuse"
+    else:  # ec
+        etc = ECTransferConfig(ec_connector="LMCacheECConnector", ec_role="ec_both",
+                               ec_connector_module_path="measure.lmcache_ec_connector")
+        llm = LLM(enable_prefix_caching=False, ec_transfer_config=etc, **common)
+        warm_variant = "vt_reuse"
+    sp = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    import vllm as _vllm
+    lmver = __import__("lmcache").__version__
 
-    vid = Path(a.video).stem
+    def med(reqs):
+        B = len(reqs)
+        for _ in range(a.warmup):
+            llm.generate(reqs, sp)
+        xs = []
+        for _ in range(a.runs):
+            torch.cuda.synchronize(); t0 = time.perf_counter()
+            out = llm.generate(reqs, sp)
+            torch.cuda.synchronize(); xs.append((time.perf_counter() - t0) * 1e3 / B)
+        return statistics.median(xs), out
+
+    videos = load_videos(a.videos_csv)
     Path(a.csv).parent.mkdir(parents=True, exist_ok=True)
     new = not Path(a.csv).exists()
-    fcsv = open(a.csv, "a", newline="")
-    W = csv.DictWriter(fcsv, fieldnames=["model", "video_id", "frames", "n_frames_real", "n_vis",
-                                         "n_prompt_tokens", "tier", "variant", "metric",
-                                         "value_ms", "run_idx", "engine", "lmcache_ver"])
+    f = open(a.csv, "a", newline="")
+    W = csv.DictWriter(f, fieldnames=["model", "dataset", "video_id", "res_label", "frames", "batch",
+                                      "n_vis", "n_prompt_tokens", "tier", "variant", "metric",
+                                      "value_ms", "engine", "lmcache_ver"])
     if new:
         W.writeheader()
 
-    def gen_ttft(req) -> float:
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        out = llm.generate([req], sp_ttft)
-        torch.cuda.synchronize()
-        dt = (time.perf_counter() - t0) * 1e3
-        return dt, len(out[0].prompt_token_ids)
+    def emit(v, nf, B, n_vis, npt, variant, val):
+        W.writerow({"model": a.model, "dataset": v["dataset"], "video_id": v["video_id"],
+                    "res_label": v["res_label"], "frames": nf, "batch": B, "n_vis": n_vis,
+                    "n_prompt_tokens": npt, "tier": a.tier, "variant": variant, "metric": "ttft",
+                    "value_ms": round(val, 3), "engine": f"vllm-{_vllm.__version__}",
+                    "lmcache_ver": lmver}); f.flush()
 
-    import vllm as _vllm
-    lmver = "none" if is_ours else __import__("lmcache").__version__
-    # Pre-loop warmup on a THROWAWAY frame count (not measured) to absorb first-call lazy
-    # init / compilation, so each nf's COLD is a clean miss (not polluted like a 5.3s first gen).
-    try:
-        wreq, _ = build_llava_video_request(proc, a.video, 8)
-        gen_ttft(wreq)
-        print("[warmup] done (throwaway 8f)")
-    except Exception as e:
-        print(f"[warmup] skipped: {e}")
-
-    for nf in a.frames:
-        try:
-            req, nfr = build_llava_video_request(proc, a.video, nf)
-        except Exception as e:
-            print(f"  frames={nf}: build FAILED, skip ({e})"); continue
-        n_vis = nfr * 196                         # LLaVA-OV: 196 tok/frame FIXED
-        # run 0 = COLD (miss -> recompute; lmcache mode also stores KV to the tier)
-        try:
-            cold_ms, n_prompt = gen_ttft(req)
-        except Exception as e:
-            print(f"  frames={nf} n_vis={n_vis}: cold gen FAILED, skip ({type(e).__name__})"); continue
-        W.writerow({"model": a.model_tag, "video_id": vid, "frames": nf, "n_frames_real": nfr,
-                    "n_vis": n_vis, "n_prompt_tokens": n_prompt, "tier": tier_label, "variant": "cold",
-                    "metric": "ttft", "value_ms": round(cold_ms, 3), "run_idx": 0,
-                    "engine": f"vllm-{_vllm.__version__}", "lmcache_ver": lmver})
-        # warmup (discard) then timed WARM runs = reuse (ours: GPU hit | lmcache: tier LOAD)
-        for _ in range(a.warmup):
-            gen_ttft(req)
-        warm = []
-        for r in range(a.runs):
-            w_ms, _ = gen_ttft(req)
-            warm.append(w_ms)
-            W.writerow({"model": a.model_tag, "video_id": vid, "frames": nf, "n_frames_real": nfr,
-                        "n_vis": n_vis, "n_prompt_tokens": n_prompt, "tier": tier_label,
-                        "variant": warm_variant, "metric": "ttft", "value_ms": round(w_ms, 3),
-                        "run_idx": r, "engine": f"vllm-{_vllm.__version__}", "lmcache_ver": lmver})
-        fcsv.flush()
-        print(f"  frames={nf:>3} n_vis={n_vis:>5} | cold {cold_ms:8.1f}ms | "
-              f"{warm_variant}(median) {statistics.median(warm):7.1f}ms | "
-              f"saving {cold_ms - statistics.median(warm):7.1f}ms  ({tier_label})")
-    fcsv.close()
-    print(f"\n[done] wrote {a.csv}  (watch stderr for LMCache 'need to load' > 0 = real tier retrieval)")
+    print(f"\n[{a.model}/{a.mode}/{a.tier}] warm {warm_variant} TTFT (ms), per-request")
+    for v in videos:
+        for nf in a.frames:
+            try:
+                req = make_req(v["path"], nf)
+            except Exception as e:
+                print(f"  {v['video_id']} f{nf}: build FAIL {type(e).__name__}"); continue
+            try:
+                _, out = med([req])                        # store/warm pass (populates tier + n_vis)
+            except Exception as e:
+                print(f"  {v['video_id']} f{nf}: store FAIL {type(e).__name__}: {str(e)[:70]}"); continue
+            npt = len(out[0].prompt_token_ids)
+            n_vis = sum(1 for t in out[0].prompt_token_ids if t == vtid) if vtid else 0
+            for B in a.batches:                            # warm: all B hit/load from tier (real reuse)
+                try:
+                    warm, _ = med([req] * B)
+                except Exception as e:
+                    print(f"  {v['video_id']} f{nf} b{B}: SKIP {type(e).__name__}: {str(e)[:60]}"); continue
+                emit(v, nf, B, n_vis, npt, warm_variant, warm)
+                print(f"  {v['video_id']:>14} f{nf:>3} b{B:>2} n_vis={n_vis:>6} | "
+                      f"{warm_variant} {warm:>7.1f} ms/req")
+    f.close()
+    print(f"\n[done] {a.csv}")
 
 
 if __name__ == "__main__":

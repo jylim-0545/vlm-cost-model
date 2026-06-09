@@ -122,16 +122,37 @@ def patch_qwen25():
 PATCHERS = {"internvl": patch_internvl, "llava": patch_llava, "qwen2.5": patch_qwen25}
 
 
+def load_videos(path):
+    import csv as _csv
+    with open(path) as f:
+        return list(_csv.DictReader(f))
+
+
+def video_token_id(spec, fam):
+    """The placeholder token id counted for n_vis (per family)."""
+    from transformers import AutoTokenizer, AutoConfig
+    if fam == "internvl":
+        tok = AutoTokenizer.from_pretrained(spec.repo_id, trust_remote_code=True)
+        return tok.convert_tokens_to_ids("<|video_pad|>")
+    cfg = AutoConfig.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
+    return getattr(cfg, "video_token_id", None) or getattr(cfg, "video_token_index", None)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default="internvl3.5-8b")
-    ap.add_argument("--video", default=os.path.expanduser("~/VLM/scratch/nextqa_videos/5396384503.mp4"))
+    ap.add_argument("--videos-csv", default="final_videos.csv")
     ap.add_argument("--frames", type=int, nargs="+", default=[16, 32, 64, 128])
+    ap.add_argument("--batches", type=int, nargs="+", default=[1, 4, 8, 16])
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--decode-tokens", type=int, default=256, help="full-latency decode length (cold only)")
     ap.add_argument("--max-model-len", type=int, default=40960)
     ap.add_argument("--max-num-batched-tokens", type=int, default=32768)
-    ap.add_argument("--csv", default="results/lmcache/preproj_vllm.csv")
+    ap.add_argument("--video-max-patches", type=int, default=768, help="Qwen per-frame max_pixels = N*28*28")
+    ap.add_argument("--video-min-patches", type=int, default=128)
+    ap.add_argument("--qwen3-longest-edge", type=int, default=768 * 28 * 28 * 256)
+    ap.add_argument("--csv", default="results/final/preproj_vllm.csv")
     a = ap.parse_args()
 
     import torch
@@ -144,60 +165,101 @@ def main() -> None:
     spec = load_models().models[a.model]
     fam = ("internvl" if spec.key.startswith("internvl") else
            "llava" if spec.key.startswith("llava") else
-           "qwen2.5" if spec.key.startswith("qwen2.5") else None)
-    assert fam in PATCHERS, f"no pre-projector patcher for {spec.key} (Qwen3 excluded -> use EC)"
-    PATCHERS[fam]()
+           "qwen2.5" if spec.key.startswith("qwen2.5") else
+           "qwen3" if spec.key.startswith("qwen3") else None)
+    assert fam, f"unknown family for {spec.key}"
+    # Qwen3 has no pre-projector patcher (DeepStack taps mid-ViT) -> measure COLD ONLY here
+    # (full recompute, no patcher needed); its vt_reuse is EC via reuse_lmcache --mode ec.
+    cold_only = fam not in PATCHERS
+    if not cold_only:
+        PATCHERS[fam]()
+    vtid = video_token_id(spec, fam)
+    needs_meta = fam == "qwen3"
 
+    mm_kwargs = None
+    if fam == "qwen2.5":
+        mm_kwargs = {"max_pixels": a.video_max_patches * 28 * 28, "min_pixels": a.video_min_patches * 28 * 28}
+    elif fam == "qwen3":
+        mm_kwargs = {"size": {"longest_edge": a.qwen3_longest_edge, "shortest_edge": 4096}}
     common = dict(model=spec.repo_id, trust_remote_code=spec.trust_remote_code,
                   max_model_len=a.max_model_len, gpu_memory_utilization=0.85, enforce_eager=True,
-                  enable_prefix_caching=False, mm_processor_cache_gb=0,
-                  max_num_batched_tokens=a.max_num_batched_tokens, limit_mm_per_prompt={"video": 1})
+                  enable_prefix_caching=False, mm_processor_cache_gb=0, mm_processor_kwargs=mm_kwargs,
+                  max_num_seqs=max(a.batches), max_num_batched_tokens=a.max_num_batched_tokens,
+                  limit_mm_per_prompt={"video": 1})
     if fam == "internvl":
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(spec.repo_id, trust_remote_code=True)
-        make_req = lambda nf: build_video_request_internvl(tok, a.video, nf)
-        tok_per_frame = 256
+        make_req = lambda path, nf: build_video_request_internvl(tok, path, nf)[0]
     else:
         from transformers import AutoProcessor
-        proc = AutoProcessor.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
-        make_req = lambda nf: build_video_request(proc, a.video, n_frames=nf, with_metadata=False)
-        tok_per_frame = 196 if fam == "llava" else 0   # qwen2.5 n_vis is dynamic -> 0 (TTFT is the check)
+        vpx = {"max_pixels": a.video_max_patches * 28 * 28,
+               "min_pixels": a.video_min_patches * 28 * 28} if fam == "qwen2.5" else {}
+        proc = AutoProcessor.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code, **vpx)
+        if needs_meta and hasattr(proc, "video_processor"):
+            proc.video_processor.size.longest_edge = a.qwen3_longest_edge
+        make_req = lambda path, nf: build_video_request(proc, path, n_frames=nf, with_metadata=needs_meta)[0]
     llm = LLM(**common)
-    sp = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    sp1 = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    spD = SamplingParams(temperature=0.0, max_tokens=a.decode_tokens, detokenize=False)
 
-    def med_ttft(req) -> float:
+    def med(reqs, sp):
+        """median per-request wall (ms) over runs; reqs = list of B requests submitted together."""
+        B = len(reqs)
         for _ in range(a.warmup):
-            llm.generate([req], sp)
+            llm.generate(reqs, sp)
         xs = []
         for _ in range(a.runs):
             torch.cuda.synchronize(); t0 = time.perf_counter()
-            llm.generate([req], sp)
-            torch.cuda.synchronize(); xs.append((time.perf_counter() - t0) * 1e3)
-        return statistics.median(xs)
+            out = llm.generate(reqs, sp)
+            torch.cuda.synchronize(); xs.append((time.perf_counter() - t0) * 1e3 / B)
+        return statistics.median(xs), out
 
+    videos = load_videos(a.videos_csv)
     Path(a.csv).parent.mkdir(parents=True, exist_ok=True)
     new = not Path(a.csv).exists()
     f = open(a.csv, "a", newline="")
-    W = csv.DictWriter(f, fieldnames=["model", "video_id", "frames", "n_vis", "cold_ttft_ms",
-                                      "pre_reuse_ttft_ms", "post_reuse_ttft_ms", "engine"])
+    W = csv.DictWriter(f, fieldnames=["model", "dataset", "video_id", "res_label", "frames", "batch",
+                                      "n_vis", "n_prompt_tokens", "variant", "metric", "value_ms", "engine"])
     if new:
         W.writeheader()
-    vid = Path(a.video).stem
-    print(f"\n[{a.model}] {'fr':>4}{'n_vis':>7} | {'COLD':>9}{'pre':>9}{'post':>9} | pre−post  cold−pre(ViT)")
-    for nf in a.frames:
-        req, _ = make_req(nf)
-        n_vis = nf * tok_per_frame
-        res = {}
-        for mode in ("cold", "pre", "post"):
-            os.environ["VLM_REUSE_MODE"] = mode
-            res[mode] = med_ttft(req)
-        os.environ["VLM_REUSE_MODE"] = "cold"
-        W.writerow({"model": a.model, "video_id": vid, "frames": nf, "n_vis": n_vis,
-                    "cold_ttft_ms": round(res["cold"], 2), "pre_reuse_ttft_ms": round(res["pre"], 2),
-                    "post_reuse_ttft_ms": round(res["post"], 2), "engine": "vllm-inproc"})
-        f.flush()
-        print(f"[{a.model}] {nf:>4}{n_vis:>7} | {res['cold']:>9.1f}{res['pre']:>9.1f}{res['post']:>9.1f} | "
-              f"{res['pre']-res['post']:>+7.1f}  {res['cold']-res['pre']:>+10.1f}")
+
+    def emit(v, nf, B, n_vis, npt, variant, metric, val):
+        W.writerow({"model": a.model, "dataset": v["dataset"], "video_id": v["video_id"],
+                    "res_label": v["res_label"], "frames": nf, "batch": B, "n_vis": n_vis,
+                    "n_prompt_tokens": npt, "variant": variant, "metric": metric,
+                    "value_ms": round(val, 3), "engine": "vllm-inproc"}); f.flush()
+
+    print(f"\n[{a.model}] cold/pre/post TTFT (ms), per-request | video×frame×batch")
+    for v in videos:
+        for nf in a.frames:
+            try:
+                req1 = make_req(v["path"], nf)
+            except Exception as e:
+                print(f"  {v['video_id']} f{nf}: build FAIL {type(e).__name__}"); continue
+            for B in a.batches:
+                reqs = [req1] * B
+                try:
+                    os.environ["VLM_REUSE_MODE"] = "cold"
+                    cold_t, out = med(reqs, sp1)
+                    npt = len(out[0].prompt_token_ids)
+                    n_vis = sum(1 for t in out[0].prompt_token_ids if t == vtid) if vtid else 0
+                    cold_full, _ = med(reqs, spD)
+                    pre_t = post_t = None
+                    if not cold_only:
+                        os.environ["VLM_REUSE_MODE"] = "pre"; pre_t, _ = med(reqs, sp1)
+                        os.environ["VLM_REUSE_MODE"] = "post"; post_t, _ = med(reqs, sp1)
+                    os.environ["VLM_REUSE_MODE"] = "cold"
+                except Exception as e:
+                    print(f"  {v['video_id']} f{nf} b{B}: SKIP {type(e).__name__}: {str(e)[:80]}")
+                    os.environ["VLM_REUSE_MODE"] = "cold"; continue
+                emit(v, nf, B, n_vis, npt, "cold", "ttft", cold_t)
+                emit(v, nf, B, n_vis, npt, "cold", "full", cold_full)
+                if not cold_only:
+                    emit(v, nf, B, n_vis, npt, "vt_pre", "ttft", pre_t)
+                    emit(v, nf, B, n_vis, npt, "vt_post", "ttft", post_t)
+                ps = f"pre {pre_t:>8.1f} post {post_t:>8.1f}" if not cold_only else "(cold-only)"
+                print(f"  {v['video_id']:>14} f{nf:>3} b{B:>2} n_vis={n_vis:>6} | "
+                      f"cold {cold_t:>8.1f} {ps} | full {cold_full:>8.1f}")
     f.close()
     print(f"\n[done] {a.csv}")
 

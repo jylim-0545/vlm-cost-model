@@ -1,0 +1,7 @@
+dataset,video_id,path,width,height,duration_s,res_label,question
+nextqa,5396384503,/home/jylim/VLM/scratch/nextqa_videos/5396384503.mp4,640,360,11.511,360,Describe in detail.
+nextqa,8212602454,/home/jylim/VLM/scratch/nextqa_videos/8212602454.mp4,640,360,34.409,360,Describe in detail.
+nextqa,5564473671,/home/jylim/VLM/scratch/nextqa_videos/5564473671.mp4,640,360,44.912,360,Describe in detail.
+mlvu,game_33,/home/jylim/VLM/scratch/mlvu_videos/game_33.mp4,1280,720,244.867,720,Describe in detail.
+mlvu,movie101_87,/home/jylim/VLM/scratch/mlvu_videos/movie101_87.mp4,1920,796,599.0,1080,Describe in detail.
+mlvu,xiaoliyu_9,/home/jylim/VLM/scratch/mlvu_videos/xiaoliyu_9.mp4,2922,2124,302.0,4k,Describe in detail.

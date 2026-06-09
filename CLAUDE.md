@@ -698,3 +698,36 @@ Run engine **IN-PROCESS** (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) so a main-process
 - InternVL-4B/14B pre-projector quick verify (same internvl patcher; deferred 2026-06-09).
 - Full cold/vt/kv sweep for the production 5(+Qwen3) models → TCO with the encoder-byte / no-stall / S3-only changes.
 - 30B MoE (InternVL/Qwen) measurement (long-term).
+
+---
+
+## 12. FINAL paper experiment — harness READY (2026-06-09)
+
+The production 3-way run. Orchestrator: **`scripts/run_final.sh`** (background; reaps jylim
+EngineCore between vLLM runs; warns on other-user GPU use; per-config OOM/overflow auto-skip).
+
+**Matrix:** 4 models {InternVL-8B, LLaVA-OV-7B, Qwen2.5-VL-7B, Qwen3-VL-8B} × frames {16,32,64,128}
+× batch {1,4,8,16} × 6 videos (`final_videos.csv`: NExT-QA 360p ×3 + MLVU game_33=720 / movie101_87≈1080
+/ xiaoliyu_9=4K). All eager (in-process monkeypatch needs it); engine-mismatch across variants accepted.
+
+**Who measures what (all REAL `generate()` TTFT, per-request = whole-batch wall / B):**
+- **cold + vt** → `measure/preproj_vllm.py` (in-process, `mm_processor_cache_gb=0` so vision re-runs):
+  cold = orig extract_feature (full recompute); vt_pre/vt_post via the encoder→projector monkeypatch.
+  **Qwen3 = COLD-ONLY here** (no pre-projector patcher → DeepStack). Records cold ttft+**full(decode=256)**
+  + vt_pre/vt_post ttft. n_vis counted from real prompt tokens. `--csv results/final/preproj_vllm.csv`.
+- **kv_reuse (all 4)** → `reuse_lmcache.py --mode lmcache --tier dram` (real KV LOAD; prefix OFF).
+  `results/final/reuse_lmcache.csv`.
+- **vt_reuse (Qwen3)** → `reuse_lmcache.py --mode ec --tier dram` (EC post-projector; mm cache ON for
+  content-hash). `results/final/reuse_ec.csv`.
+
+**cold source = preproj_vllm** (NOT reuse_real) — real full recompute, validated (InternVL 308 / Qwen2.5
+670@720 ms @16f), same engine as vt for the 3 patchable models → clean cold−vt saving.
+
+**Measurement tier = DRAM** (real DRAM→GPU load, ~42–52 GB/s measured). storage→DRAM (S3 / local) is
+COMPUTED in TCO (§7). **TCO knobs (per §11): encoder-output bytes for vt, GPU-stall OFF, S3-only.**
+**decode_tokens = 256** (preproj cold `full`; decode is variant-independent so vt/kv full = their ttft +
+(cold_full − cold_ttft)). Long-format CSVs keyed by (model,dataset,video_id,res_label,frames,batch,n_vis,
+variant,metric).
+
+Launch: `nohup bash scripts/run_final.sh > results/final/run.log 2>&1 &`. Prior results archived to
+`results/_archive/pre_final_20260609/`.

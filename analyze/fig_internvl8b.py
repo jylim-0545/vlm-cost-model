@@ -34,12 +34,28 @@ _ap.add_argument("--dataset", default="nextqa")
 _a = _ap.parse_args()
 MODEL = _a.model; FRAME = _a.frame; DATASET = _a.dataset
 TAG = {"internvl3.5-8b": "internvl8b", "internvl3.5-4b": "internvl4b", "internvl3.5-14b": "internvl14b",
-       "qwen2.5-vl-7b": "qwen25", "llava-ov-7b": "llavaov"}.get(MODEL, MODEL.replace(".", "").replace("-", ""))
+       "qwen2.5-vl-7b": "qwen25", "qwen3-vl-8b": "qwen3vl8b", "llava-ov-7b": "llavaov"}.get(MODEL, MODEL.replace(".", "").replace("-", ""))
 TITLE = {"internvl3.5-8b": "InternVL-8B", "internvl3.5-4b": "InternVL-4B", "internvl3.5-14b": "InternVL-14B",
-         "qwen2.5-vl-7b": "Qwen2.5-VL", "llava-ov-7b": "LLaVA-OV-7B"}.get(MODEL, MODEL)
+         "qwen2.5-vl-7b": "Qwen2.5-VL", "qwen3-vl-8b": "Qwen3-VL-8B", "llava-ov-7b": "LLaVA-OV-7B"}.get(MODEL, MODEL)
 DECODE = 256
 CSV = os.path.expanduser(f"~/VLM/results/{DATASET}/reuse_real.csv")
 OUT = Path(os.path.expanduser(f"~/VLM/results/{DATASET}/{TAG}")); OUT.mkdir(parents=True, exist_ok=True)
+
+# ---- pin to ONE video (stem) so n_vis is consistent per frame. Multi-video models (Qwen,
+# dynamic tok/frame) otherwise mix videos with DIFFERENT n_vis per frame -> the frame sweep
+# folds back on the n_vis x-axis. Fixed-tok/frame models (InternVL/LLaVA) are unaffected (same
+# n_vis across videos) but the filter is harmless. Pick the stem with the most rows = the
+# batch-sweep video (the only one with batch>1 coverage). ----
+import re as _re
+def _stem(vid):  # strip the _b{N} batch suffix
+    return _re.sub(r"_b\d+$", "", vid or "")
+_cnt = defaultdict(int)
+with open(CSV) as _f:
+    for _r in csv.DictReader(_f):
+        if _r["model"] == MODEL:
+            _cnt[_stem(_r["video_id"])] += 1
+VIDEO = max(_cnt, key=_cnt.get) if _cnt else None
+print(f"[fig] {MODEL}: pinned video stem = {VIDEO} ({_cnt.get(VIDEO,0)} rows)")
 
 # ---- load: (batch) -> metric medians for {TITLE} at FRAME ----
 WANT = {("cold", "ttft"): "cold_ttft", ("cold", "full"): "cold_full",
@@ -49,7 +65,7 @@ WANT = {("cold", "ttft"): "cold_ttft", ("cold", "full"): "cold_full",
 vals = defaultdict(lambda: defaultdict(list)); meta = {}
 with open(CSV) as f:
     for r in csv.DictReader(f):
-        if r["model"] != MODEL or int(r["frames"]) != FRAME:
+        if r["model"] != MODEL or int(r["frames"]) != FRAME or _stem(r["video_id"]) != VIDEO:
             continue
         b = int(r["batch"] or 1)
         s = WANT.get((r["variant"], r["metric"]))
@@ -61,6 +77,9 @@ for b in B:
     B[b]["n_vis"] = int(meta[b]["n_vis"]); B[b]["kv_bytes"] = int(meta[b]["kv_bytes"])
     B[b]["token_bytes"] = int(meta[b]["token_bytes"])
 batches = sorted(B)
+if 1 not in B:                       # no data for this (model, FRAME, pinned video) -> skip, don't crash
+    print(f"[fig] {TITLE} frame={FRAME}: NO batch-1 data for video {VIDEO} (skipping figures)")
+    sys.exit(0)
 b1 = B[1]
 print(f"[fig] {TITLE} frame={FRAME} batches={batches} n_vis={b1['n_vis']}")
 
@@ -68,7 +87,7 @@ print(f"[fig] {TITLE} frame={FRAME} batches={batches} n_vis={b1['n_vis']}")
 FB = defaultdict(lambda: defaultdict(list)); FBn = {}
 with open(CSV) as f:
     for r in csv.DictReader(f):
-        if r["model"] != MODEL or int(r["batch"] or 1) != 1:
+        if r["model"] != MODEL or int(r["batch"] or 1) != 1 or _stem(r["video_id"]) != VIDEO:
             continue
         nf = int(r["frames"]); s = WANT.get((r["variant"], r["metric"]))
         if s:
@@ -122,7 +141,7 @@ fig.tight_layout(); fig.savefig(OUT / f"fig6_tpot.png", dpi=150); plt.close(fig)
 FF = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))   # frame -> batch -> metric
 with open(CSV) as f:
     for r in csv.DictReader(f):
-        if r["model"] != MODEL:
+        if r["model"] != MODEL or _stem(r["video_id"]) != VIDEO:
             continue
         nf = int(r["frames"]); bb = int(r["batch"] or 1)
         for (vv, mm), kk in [(("cold", "full"), "cold_full"),
@@ -223,85 +242,27 @@ axes[0][0].legend(fontsize=7)
 fig.suptitle(f"{TITLE} TCO saving vs baseline ({FRAME}f, H2D excl.)", fontsize=10)
 fig.tight_layout(); fig.savefig(OUT / f"fig5_saving.png", dpi=150); plt.close(fig)
 
-# ===== Fig 5_1: TCO saving vs baseline (%), batch=1 only =====
-d = B[1]
-fig, ax = plt.subplots(figsize=(5.0, 3.6))
-for t in tier_names:
-    tier = tiers[t]
-    base = tco("baseline", tier, d, Np)
-    for var, c in [("vt_reuse", "#2ca02c"), ("kv_reuse", "#d62728")]:
-        pct = (base - tco(var, tier, d, Np)) / base * 100.0
-        lab = var + (f" ({t})" if len(tier_names) > 1 else "")
-        ax.plot(Np, pct, color=c, label=lab, lw=1.8)
-ax.axhline(0, color="k", ls=":", lw=0.8)
-ax.set_xlabel("N (queries/month)"); ax.set_ylabel("TCO saving vs baseline (%)")
-ax.set_ylim(-20, 60); ax.grid(alpha=0.3); ax.legend(fontsize=8)
-ax.set_title(f"{TITLE} TCO saving (batch=1, {FRAME}f, H2D excl.)")
-fig.tight_layout(); fig.savefig(OUT / f"fig5_1_saving_batch1.png", dpi=150); plt.close(fig)
+# single-batch saving curves at the serving batch (8 if available, else max measured)
+BB = 8 if 8 in B else max(B)
+d = B[BB]
 
-# ===== Fig 5_0: TCO saving (%) at LONG retention R=1000 months (batch=1, H2D excl.) =====
-# At huge R the one-time store cost F is fully amortized; storage rent (x R) vs per-query
-# saving decides. KV (large bytes) pays heavy rent -> saving collapses; vt stays cheap.
-_R0, _ret0 = R, retention
-R, retention = 1000.0, 1000.0 * 30
-d = B[1]
-fig, ax = plt.subplots(figsize=(5.0, 3.6))
-for t in tier_names:
-    tier = tiers[t]
-    base = tco("baseline", tier, d, Np)
-    for var, c in [("vt_reuse", "#2ca02c"), ("kv_reuse", "#d62728")]:
-        pct = (base - tco(var, tier, d, Np)) / base * 100.0
-        lab = var + (f" ({t})" if len(tier_names) > 1 else "")
-        ax.plot(Np, pct, color=c, label=lab, lw=1.8)
-ax.axhline(0, color="k", ls=":", lw=0.8)
-ax.set_xlabel("N (queries/month)"); ax.set_ylabel("TCO saving vs baseline (%)")
-ax.set_ylim(-20, 60); ax.grid(alpha=0.3); ax.legend(fontsize=8)
-ax.set_title(f"{TITLE} TCO saving (batch=1, {FRAME}f, R=1000mo)")
-fig.tight_layout(); fig.savefig(OUT / f"fig5_0_saving_R1000.png", dpi=150); plt.close(fig)
-print(f"\n=== Fig5_0 saving %% at R=1000mo (batch=1, S3, H2D excl.), N in {{1,10,60}} ===")
-for t in tier_names:
-    tier = tiers[t]
-    for var in ("vt_reuse", "kv_reuse"):
-        vals_pct = [(tco("baseline", tier, d, n) - tco(var, tier, d, n)) / tco("baseline", tier, d, n) * 100
-                    for n in (1.0, 10.0, 60.0)]
-        print(f"  {t:<16}{var:<10}" + "".join(f"N={n:>3.0f}:{v:>6.1f}%  " for n, v in zip((1, 10, 60), vals_pct)))
-R, retention = _R0, _ret0
-
-# ===== Fig 5_2: TCO saving (%) WITH retrieval cost (storage->DRAM + H2D), grid batch x tier =====
-fig, axes = plt.subplots(len(BL), len(tier_names), figsize=(4.0*len(tier_names), 3.0*len(BL)),
-                         sharex=True, sharey=True, squeeze=False)
-for i, b in enumerate(BL):
-    d = B[b]
-    for j, t in enumerate(tier_names):
-        ax = axes[i][j]; tier = tiers[t]
-        base = tco("baseline", tier, d, Np, retr=True)
+# ===== Fig 5_1 (local) / 5_2 (s3): TCO saving vs N, one figure per tier, L=retr EXCL | R=retr INCL =====
+for fnum, tname, ylim in [("5_1", "local_nvme", (-20, 70)), ("5_2", "s3_same_region", (-100, 70))]:
+    if tname not in tiers:
+        continue
+    tier = tiers[tname]
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.8), sharey=True)
+    for ax, (retr, plab) in zip(axes, [(False, "retrieval EXCLUDED"), (True, "retrieval INCLUDED")]):
+        base = tco("baseline", tier, d, Np, retr=retr)
         for var, c in [("vt_reuse", "#2ca02c"), ("kv_reuse", "#d62728")]:
-            pct = (base - tco(var, tier, d, Np, retr=True)) / base * 100.0
-            ax.plot(Np, pct, color=c, label=var, lw=1.6)
+            pct = (base - tco(var, tier, d, Np, retr=retr)) / base * 100.0
+            ax.plot(Np, pct, color=c, label=var, lw=1.8)
         ax.axhline(0, color="k", ls=":", lw=0.8)
-        if i == 0: ax.set_title(t, fontsize=9)
-        if j == 0: ax.set_ylabel(f"batch={b}\nsaving (%)", fontsize=8)
-        if i == len(BL)-1: ax.set_xlabel("N (queries/month)")
-        ax.grid(alpha=0.3); ax.set_ylim(-100, 60)
-axes[0][0].legend(fontsize=7)
-fig.suptitle(f"{TITLE} TCO saving vs baseline ({FRAME}f, retrieval INCLUDED)", fontsize=10)
-fig.tight_layout(); fig.savefig(OUT / f"fig5_2_saving_retr.png", dpi=150); plt.close(fig)
-
-# ===== Fig 5_3: TCO saving (%) WITH retrieval, batch=1 only =====
-d = B[1]
-fig, ax = plt.subplots(figsize=(5.0, 3.6))
-for t in tier_names:
-    tier = tiers[t]
-    base = tco("baseline", tier, d, Np, retr=True)
-    for var, c in [("vt_reuse", "#2ca02c"), ("kv_reuse", "#d62728")]:
-        pct = (base - tco(var, tier, d, Np, retr=True)) / base * 100.0
-        lab = var + (f" ({t})" if len(tier_names) > 1 else "")
-        ax.plot(Np, pct, color=c, label=lab, lw=1.8)
-ax.axhline(0, color="k", ls=":", lw=0.8)
-ax.set_xlabel("N (queries/month)"); ax.set_ylabel("TCO saving vs baseline (%)")
-ax.set_ylim(-100, 60); ax.grid(alpha=0.3); ax.legend(fontsize=8)
-ax.set_title(f"{TITLE} TCO saving (batch=1, {FRAME}f, retr ON)")
-fig.tight_layout(); fig.savefig(OUT / f"fig5_3_saving_retr_batch1.png", dpi=150); plt.close(fig)
+        ax.set_xlabel("N (queries/month)"); ax.set_title(plab, fontsize=9)
+        ax.set_ylim(*ylim); ax.grid(alpha=0.3)
+    axes[0].set_ylabel("TCO saving vs baseline (%)"); axes[0].legend(fontsize=8)
+    fig.suptitle(f"{TITLE} TCO saving — {tname} (batch={BB}, {FRAME}f)", fontsize=10)
+    fig.tight_layout(); fig.savefig(OUT / f"fig{fnum}_saving_{tname}_b{BB}.png", dpi=150); plt.close(fig)
 
 # ===== Fig 8: TTFT latency breakdown (batch=1) — compute / storage->DRAM / H2D, per tier =====
 # Both tiers shown (retrieval is tier-dependent). H2D is tiny -> annotated with an arrow.

@@ -65,6 +65,10 @@ def main() -> None:
     ap.add_argument("--video-max-patches", type=int, default=768,
                     help="Qwen only: VIDEO_MAX_PIXELS = N*28*28 (Qwen-native 768).")
     ap.add_argument("--video-min-patches", type=int, default=128)
+    ap.add_argument("--qwen3-longest-edge", dest="qwen3_longest_edge", type=int, default=768 * 28 * 28 * 256,
+                    help="Qwen3 only: video_processor.size.longest_edge (TOTAL-video token budget). "
+                         "Default ~154M lifts the 12288-token saturation so n_vis ∝ frames like other "
+                         "models. Set 0 to keep the stock 25.2M (n_vis saturates ~12288).")
     ap.add_argument("--cudagraph", action="store_true")
     ap.add_argument("--max-num-batched-tokens", dest="max_num_batched_tokens", type=int, default=None,
                     help="vLLM chunked-prefill batch / encoder-cache budget. Raise to 32768 for LLaVA "
@@ -101,6 +105,13 @@ def main() -> None:
         vpx = {} if is_llava else {"max_pixels": a.video_max_patches * 28 * 28,
                                    "min_pixels": a.video_min_patches * 28 * 28}
         proc = AutoProcessor.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code, **vpx)
+        # Qwen3-VL: lift the TOTAL-video token budget. Its video_processor.size.longest_edge
+        # (default 25.2M px) caps TOTAL video tokens -> n_vis SATURATES at ~12288 regardless of
+        # frames. Raise it so n_vis grows ∝ frames like the other models (per-frame max_pixels
+        # still caps each frame). Must match the vLLM engine's mm_processor_kwargs below.
+        # (Qwen2.5's longest_edge IS the per-frame max_pixels -> no total cap -> no override needed.)
+        if needs_meta and a.qwen3_longest_edge > 0 and hasattr(proc, "video_processor"):
+            proc.video_processor.size.longest_edge = a.qwen3_longest_edge
         _cfg = AutoConfig.from_pretrained(spec.repo_id, trust_remote_code=spec.trust_remote_code)
         vtid = getattr(_cfg, "video_token_id", None) or getattr(_cfg, "video_token_index", None)
         if is_llava:  # vt_reuse goes through the image-embeds path (video path ignores embeds)
@@ -120,6 +131,8 @@ def main() -> None:
     vt_mmhit = a.vt_mode == "mmhit"   # encode-skip via mm-cache hit instead of embeds injection
     mm_kwargs = None if (is_internvl or is_llava) else {
         "max_pixels": a.video_max_patches * 28 * 28, "min_pixels": a.video_min_patches * 28 * 28}
+    if needs_meta and a.qwen3_longest_edge > 0 and mm_kwargs is not None:  # Qwen3: match the HF proc's
+        mm_kwargs["size"] = {"longest_edge": a.qwen3_longest_edge, "shortest_edge": 4096}  # raised budget
     print(f"[reuse_real] pass={a.pass_} loading {spec.repo_id} "
           f"(prefix={'OFF' if cold_vt else 'ON'}, cudagraph={a.cudagraph}, batches={a.batches}) ...", flush=True)
     llm = LLM(model=spec.repo_id, trust_remote_code=spec.trust_remote_code,
@@ -130,6 +143,16 @@ def main() -> None:
               enable_mm_embeds=True, mm_processor_kwargs=mm_kwargs,
               limit_mm_per_prompt={"video": 1, "image": 1})
     HID = spec.hidden_size
+    # Qwen3-VL DeepStack enlarges the injected video-embed dim: the vision tower outputs
+    # out_hidden_size*(1+#deepstack_levels) and the video_embeds inject path SKIPS the tower,
+    # so injected embeds must match that enlarged dim (else the deepstack channel split fails).
+    # Qwen2.5 (no deepstack) and others stay at HID.
+    vt_embed_dim = HID
+    if needs_meta and proc is not None:
+        _vc = getattr(_cfg, "vision_config", None)
+        _dsi = getattr(_vc, "deepstack_visual_indexes", None) if _vc is not None else None
+        if _dsi:
+            vt_embed_dim = getattr(_vc, "out_hidden_size", HID) * (1 + len(_dsi))
     sp1 = SamplingParams(temperature=0.0, min_tokens=1, max_tokens=1, ignore_eos=True, detokenize=False)
     spD = SamplingParams(temperature=0.0, min_tokens=a.decode_tokens, max_tokens=a.decode_tokens,
                          ignore_eos=True, detokenize=False)
@@ -215,14 +238,26 @@ def main() -> None:
                     er = {"prompt": raw,
                           "multi_modal_data": {"video": torch.randn(1, n_vis, HID, dtype=torch.bfloat16)}}
                 else:
-                    _v = req["multi_modal_data"]["video"]; _f = _v[0] if isinstance(_v, tuple) else _v
-                    _raw = proc(text=[req["prompt"]], videos=[_f], return_tensors="pt")
-                    _vmm = {"video_embeds": torch.randn(n_vis, HID, dtype=torch.bfloat16),
+                    _v = req["multi_modal_data"]["video"]
+                    if needs_meta:  # Qwen3: video is (frames, metadata). MUST forward metadata +
+                        # do_sample_frames=False, else HF re-samples frames-only to grid_t=2 -> n_vis
+                        # 4x too small (440 vs cold's 1760 @16f), so vt would NOT align with cold.
+                        _f, _meta = _v
+                        _raw = proc(text=[req["prompt"]], videos=[_f],
+                                    video_metadata=[{k: _meta[k] for k in _meta if k != "do_sample_frames"}],
+                                    do_sample_frames=False, return_tensors="pt")
+                    else:                # Qwen2.5: frames-only (cold is also frames-only -> grids agree)
+                        _f = _v[0] if isinstance(_v, tuple) else _v
+                        _raw = proc(text=[req["prompt"]], videos=[_f], return_tensors="pt")
+                    _vmm = {"video_embeds": torch.randn(n_vis, vt_embed_dim, dtype=torch.bfloat16),
                             "video_grid_thw": _raw["video_grid_thw"]}
                     if needs_meta:  # Qwen3: video_embeds path needs per-frame timestamps
-                        # (placeholder build + temporal RoPE). len must == grid_thw[0] (temporal dim).
+                        # (placeholder build + temporal RoPE). NESTED [[...]] — timestamps is
+                        # MultiModalFieldConfig.batched("video"), so the OUTER list is the per-video
+                        # batch dim; a flat list is read as batch=N -> "Cannot merge batch sizes".
+                        # inner len must == grid_thw[0] (temporal dim).
                         _t = int(_raw["video_grid_thw"][0][0])
-                        _vmm["timestamps"] = [float(i) for i in range(_t)]
+                        _vmm["timestamps"] = [[float(i) for i in range(_t)]]
                     er = {"prompt": req["prompt"], "multi_modal_data": {"video": _vmm}}
                 ereqs = [er] * B
                 for _ in range(a.warmup):

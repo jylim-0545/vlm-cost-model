@@ -19,6 +19,14 @@ We compare three "price models":
 2. **KV reuse** — store the KV cache; reuse skips encode + prefill (decode only).
 3. **vision-token reuse** — store vision tokens; reuse skips encode (prefill still runs).
 
+> **⚠️ 2026-06-09 PIVOT — read §11.** The measurement now uses a **3-way, all REAL-measured
+> in vLLM**: (1) **cold** = vLLM full recompute; (2) **kv_reuse** = **LMCache**-based (real KV
+> offload+reload — the retrieval we used to COMPUTE is now MEASURED); (3) **vt_reuse** =
+> **vLLM-based PRE-projector** (reuse the ENCODER/ViT output, skip ViT, re-run the cheap
+> projector) — or **POST-projector via EC** where pre is impossible (Qwen3 DeepStack). §5's
+> reuse_real (inject-based post-projector vt + warm-cache kv) is the PRIOR phase; §11 supersedes
+> the mechanism. The economic question is unchanged.
+
 The economic intuition we are testing:
 - Storage is cheap and roughly constant over time; recompute is expensive and
   recurs on every access. So if a video is queried N times, the per-access
@@ -145,6 +153,12 @@ config/models.yaml — case matters (HF cache dir is case-sensitive):**
 - `openGVLab/InternVL3_5-14B` — **lowercase**, trust_remote_code
 - `llava-hf/llava-onevision-qwen2-7b-ov-hf` — NO trust_remote_code (native vLLM/transformers)
 
+**30B MoE added on disk (2026-06-09, LONG-TERM target — see §11):** `OpenGVLab/InternVL3_5-30B-A3B-Instruct`
+and `Qwen/Qwen3-VL-30B-A3B-Instruct` (A3B = 30B total / 3B active). Fit H100 (~60GB weights, smaller 96KB
+KV than 14B); compute cheap (active 3B) → a stress-test of "store-vs-recompute" in the compute-cheap regime
+(cheap compute → reuse pays off LESS, esp. kv_reuse whose advantage is skipping the now-cheap prefill).
+NOT yet measured.
+
 NOTE: Qwen3-VL (Sept 2025) and InternVL3.5 (Aug 2025) are recent; they require a
 new enough transformers (confirmed: transformers 5.9.0 in env). If a model fails
 to load with an "unknown architecture" or similar error, REPORT the exact
@@ -157,11 +171,40 @@ stage_timing_vllm.py):**
   Tokens/frame are **DYNAMIC (∝ resolution)**: 640×360→149, 720p→598, 4K→3952 tok/frame
   → high-res MLVU overflows context. **Cap with VIDEO_MAX/MIN_PIXELS** (768/128 ·28·28,
   Qwen-native) via `mm_processor_kwargs` on the engine AND `max_pixels=` on the HF
-  processor (must match) → ~360 tok/frame, uniform across resolutions.
+  processor (must match) → ~360 tok/frame, uniform across resolutions. For Qwen2.5 the
+  video processor's `size.longest_edge` = the max_pixels we pass (PER-FRAME cap), so n_vis
+  ∝ frames with NO total-video saturation (unlike Qwen3 — see longest_edge note below).
 - **Qwen3-VL**: REQUIRES video metadata → `{"video": (frames, {total_num_frames, fps,
   frames_indices, do_sample_frames:False, width, height, duration, video_backend})}`.
-  cold/kv work; **vt_reuse (video-embeds inject) still raises `KeyError:'timestamps'`
-  in vLLM 0.22 → UNRESOLVED** (build vt_reuse after cold/kv so only it is lost).
+  cold/kv/**vt_reuse all RESOLVED 2026-06-07 — NO vLLM patch needed** (unlike LLaVA). The
+  vt n_vis "mismatch" (cold 1760 vs vt 440 @16f) was a `reuse_real.py` request-construction
+  bug, NOT vLLM: **1760 is CORRECT** (grid_t=8=16/temporal_patch2; grid[8,22,40] prod/4=1760).
+  Three vt-inject fixes: (1) pass `video_metadata=[{...}]`+`do_sample_frames=False` to the HF
+  `proc()` (frames-only re-sampled to grid_t=2 → 440); (2) embeds dim = `out_hidden_size*(1+
+  len(deepstack_visual_indexes))` = 4096·4 = **16384** (DeepStack; inject skips the tower so
+  must match its output dim), not HID; (3) timestamps **NESTED** `[[0..t-1]]` (it's
+  `MultiModalFieldConfig.batched("video")` → outer list = per-video batch; flat → "Cannot merge
+  batch sizes"). Validated H100: vt<cold at 16f (152<204) & 64f (524<1059), n_vis aligned
+  (1760/7040), encode saving super-linear — matches InternVL/LLaVA/Qwen2.5.
+- **⚠️ Qwen3 n_vis SATURATES — `size.longest_edge` is a TOTAL-video token budget (we set it):**
+  Unlike Qwen2.5 (per-frame cap), Qwen3's video processor `size.longest_edge=25,165,824 px`
+  is a TOTAL budget → n_vis SATURATES at ~12,288 tok (=25165824/16²/4/2) regardless of frames
+  (more frames → processor shrinks per-frame res). So **for Qwen3, WE set max n_vis** via
+  longest_edge, NOT the video. To sweep n_vis like the other models (up to ~32768), **RAISE
+  `proc.video_processor.size.longest_edge`** (e.g. ×256) → n_vis ∝ frames again (1280×720:
+  7040/14080/28160/56320 @16/32/64/128f). Caveat: raised budget breaks resolution-uniformity
+  (1280×720→440 vs 4K→580 tok/frame) and per-frame max_pixels still caps each frame — but that's
+  FINE: n_vis is the x-axis (see encode∝n_vis note). Must set longest_edge on BOTH the HF proc
+  (reuse_real) AND the vLLM engine (mm_processor_kwargs) so cold & vt agree. 128f×1280×720=56320
+  overflows ctx 40960 → cap frames so n_vis ≤ ~32768.
+- **✅ encode ∝ n_vis, RESOLUTION-INDEPENDENT (verified 2026-06-07, Qwen2.5+Qwen3):** at matched
+  n_vis, varying resolution (320×240/640×480/1280×720, frames adjusted) gave enc/n_vis ≈ 90-103
+  (qwen2.5) / 84-94 µs/tok (qwen3), ±10-15% scatter, NO resolution trend. (Theoretical within-frame-
+  attention worry didn't materialize — ViT is MLP-dominated.) → **n_vis is a sufficient x-axis for
+  ALL components (encode/prefill/decode/KV); resolution only sets where a (video,frame) lands on it.
+  So 1 video suffices for the cost sweep for EVERY model** (Qwen included, with raised longest_edge).
+  Artifacts: results/qwen_res_encode/, analyze/qwen_res_encode.py. Real video tok/frame (max_pixels
+  768·28·28, BELOW saturation): 320×240→qwen2.5 70/qwen3 40; 640×480→195/150; 1280×720&4K capped→~360.
 - **InternVL3.5**: native `<video>` placeholder + `{"video": frames}`; ctx token
   `<|video_pad|>` (count for n_vis). No `max_dynamic_patch`; native **256 tok/frame
   FIXED** (resolution-independent → clean n_vis ∝ n_frame). No HF processor → tokenizer
@@ -275,13 +318,18 @@ controlling vLLM's TWO reuse caches:
 - **vt_reuse** = inject precomputed embeds (`enable_mm_embeds=True`) → encoder
   SKIPPED, real encode-skip prefill. random embeds (values irrelevant for latency;
   only shape / n_vis matters). Per-family injection:
-  - Qwen: `{"video": {"video_embeds": (n_vis,H), "video_grid_thw": grid}}`
+  - Qwen2.5: `{"video": {"video_embeds": (n_vis,HID), "video_grid_thw": grid}}` — frames-only
+    proc() (cold is also frames-only → grids agree; no metadata/deepstack).
+  - Qwen3 (RESOLVED 2026-06-07, no vLLM patch): `{"video": {"video_embeds": (n_vis, **16384**),
+    "video_grid_thw": grid, "timestamps": [[0..t-1]]}}`. Build the grid via `proc(...,
+    video_metadata=[{...}], do_sample_frames=False)` (NOT frames-only — that re-samples to
+    grid_t=2 → n_vis 4× too small). embeds dim = `out_hidden_size*(1+len(deepstack_visual_indexes))`
+    = 16384 (DeepStack); timestamps NESTED (per-video batch). See Section 3 Qwen3 quirks.
   - InternVL: `{"image": (1, n_vis, H)}` — vLLM's InternVL **video-embeds** path is
     an unfinished TODO, but video == single-tile 256-tok image sequence, so inject
     ALL n_vis as ONE image item (verified n_vis matches the video path; a single
     item also has ZERO per-item scatter overhead — measured N-item adds 0.3% @16f,
-    4.5% @64f). Build vt_reuse AFTER cold/kv so a construction failure (Qwen3's
-    vLLM video-embeds path still raises KeyError:'timestamps') loses ONLY
+    4.5% @64f). Build vt_reuse AFTER cold/kv so any construction failure loses ONLY
     vt_reuse, not baseline+kv.
   - LLaVA-OV: VIDEO-embeds via PATCHED vLLM (see Section 3 LLaVA quirks). RAW prompt (single
     `<video>`) + `{"video": (1, n_vis, H)}` → vLLM expands to n_vis FLAT tokens. (The earlier
@@ -328,6 +376,11 @@ n_vis is controlled directly as the x-axis). **InternVL = 256 tok/frame FIXED**
 BOTH the HF processor (for embeds_req's grid) AND the vLLM engine
 (`mm_processor_kwargs`) so they agree — else high-res MLVU (4K = 3952 tok/frame)
 overflows 40960 context. NExT-QA is low-res so the cap is a no-op there.
+**FAIRNESS RESOLVED (2026-06-07): n_vis is a sufficient x-axis for ALL models** — encode (and
+prefill/decode/KV) is ∝ n_vis and RESOLUTION-INDEPENDENT at matched n_vis (verified, Section 3
+Qwen notes). So the "encode-vs-n_frame ambiguity" for dynamic Qwen is moot: just use measured
+n_vis as x. **1 video + frame sweep suffices for every model** (Qwen3 needs raised longest_edge
+to keep n_vis ∝ frames instead of saturating at 12288 — Section 3).
 
 ### Secondary / cross-check (NOT the main path)
 - `stage_timing_vllm.py`: batch=1 ttft/decode + `--text-baseline` encode/prefill
@@ -434,6 +487,32 @@ retrieval_total = network_cost + h2d x resource_price                 # + DRAM->
   KV switch** — stall OFF revives KV reuse on all same-region tiers (~50/mo); (f) egress
   kills object_internet, but even egress=0 won't save KV on slow tiers (bandwidth does).
 
+### 7.1 Workload-level TCO (2026-06-08, `tco_report.py` + `total_vpm.csv` → `Report.md`)
+Beyond per-(model,n_vis) break-even, we compute **workload TCO saving** over a REAL popularity dist
+(`total_vpm.csv`: 88,217 videos, views/month + age_months). Per-video optimal: cache iff `N·R·saving_per_q
+> F + storage·R` (= N≥N*), else recompute. Saving% = Σ_cached max(0,gain) / Σ_all baseline_TCO (decode
+included → % of TOTAL TCO). **Op point: frame=128, batch=8, R=median age (~50mo), x-axis = measured n_vis,
+vt_reuse MAIN + kv_reuse compare; 4 models (IVL-8B, LLaVA, Qwen2.5, Qwen3 — 4B/14B dropped from report).**
+Key results & mechanisms:
+- **vt_reuse saves 13–37% (local) / 8–31% (s3) of total TCO and is tier-INSENSITIVE** (vt bytes tiny →
+  retrieval cheap). **kv_reuse: high on local (40–65%) but DIES on s3** (InternVL/Qwen3 N*=`never`) — it's
+  **retrieval (bandwidth), not storage rent**, that kills KV (verified by --no-retrieval: KV revives 68–76%).
+- **Break-even coverage (heavy-tail):** on s3 only **21–38% of videos** clear vt's N* (2.6–12/mo), yet those
+  cover **~99.7% of all views** — cache the popular minority, recompute the long-tail (≈0 view volume).
+- **vt inject overhead ≈ FIXED ~53ms** (batch=8; in-engine embeds scatter/merge, NOT the h2d transfer).
+  It's baked into measured vt_ttft → TCO already reflects it. It suppresses apparent encode-saving at SMALL
+  n_vis (back it out → encode/n_vis ≈ constant ~19µs/tok, i.e. the encoder IS linear).
+- **decode is batch-dependent:** batch=1 decode is WEIGHT-bandwidth-bound → ~n_vis-independent (fixed FFN
+  floor); batch↑ amortizes weights → KV-bound → decode ∝ n_vis (measured: n_vis 8× → decode b1 1.2×, b16 3.85×).
+  encode ALSO collapses with batch (encoder parallelizes: b1→b8 encode 1004→550ms). So batch↑ → decode/encode
+  collapse → kv saving% UP; vt% roughly flat.
+- **saving% vs n_vis is NON-monotonic (rise→peak→fall):** the FIXED decode FFN floor (~312ms@b8, n-independent)
+  dominates the denominator at small n_vis → suppresses saving% (rising region); prefill (super-linear, vt
+  can't skip it) dominates at large n_vis → falling region. **TTFT% (denom=encode+prefill, NO decode floor)
+  peaks EARLY (~32f) and is ~monotone down without the inject-overhead artifact; TCO% (denom +decode floor)
+  peaks LATE (~n_vis 40–65k ≈ ctx limit), so within feasible n_vis it looks rise→plateau, decline only just
+  beyond ctx.** prefill is only mildly super-linear (~n^1.2) here (FFN+flash-attn), not n², so decline is slow.
+
 ---
 
 ## 8. Code conventions
@@ -488,10 +567,22 @@ analyze/
                        #   tier x gpu-stall x egress sweep; --models filter; (model,n_vis) aggregate
   price_model.py       # analytical (stage-split) break-even — cross-check variant
   fig_internvl8b.py    # ***FIGURES*** --model/--frame/--dataset parameterized. fig1 TTFT-vs-n_vis,
-                       #   fig2 throughput, fig3 break-even, fig5/5_1/5_2/5_3 TCO-saving%,
+                       #   fig2 throughput, fig3 break-even, fig5 TCO-saving% grid(batch×tier),
+                       #   fig5_1 = LOCAL saving-vs-N @batch=8 (L:retr-EXCL | R:retr-INCL panels),
+                       #   fig5_2 = S3 saving-vs-N @batch=8 (same 2 panels; shows kv dies w/ retrieval)
+                       #   (2026-06-08: old fig5_0 R=1000mo & fig5_2 retr-grid REMOVED; per-tier 2-panel now),
                        #   fig6 TPOT, fig7 tput-by-frame, fig8 TTFT-breakdown (compute/sto→DRAM/H2D).
                        #   fig3/5 use s3_same_region only; fig8 shows both tiers.
+                       #   PINS to ONE video (stem w/ most rows = the batch-sweep video) so the n_vis
+                       #   x-axis is monotonic — multi-video Qwen data has varying n_vis/frame and would
+                       #   fold back. InternVL/LLaVA unaffected (fixed tok/frame). Skips if no batch-1 data.
   plots.py             # primitives CSV + config -> break_even/cost_share figs (x=n_vis)
+  tco_workload.py      # ***WORKLOAD TCO*** per-video-optimal caching over total_vpm.csv (real
+                       #   views/month + age dist); --frame/--batch/--tier/--no-retrieval/--retention-months
+  tco_report.py        # ***REPORT FIGS/TABLES*** -> results/report/fig1..7 + Report.md tables.
+                       #   default op point: frame=128, batch=8, R=median age. vt_reuse MAIN, kv compare.
+total_vpm.csv          # 88,217 real videos: views_per_month (N, heavy-tail median≈1.1) + age_months (R, median≈50)
+Report.md              # ***DELIVERABLE*** (Korean) workload-TCO report; figs in results/report/
 scripts/run_full.sh    # orchestrator (per-(model,dataset) process, freeze watchdog, EngineCore reap)
         run_qwen25_2pass.sh / run_intern_4b_14b.sh / run_llava_ve.sh  # per-model launchers
                        #   (run_llava_ve.sh = LLaVA video-embeds, 1 video, 16-128f, batched-tokens 32768)
@@ -519,10 +610,31 @@ works (MLVU needs max_pixels cap). **LLaVA-OV-7B** RESOLVED on H100 (2026-06-05)
 (−122/−255/−444/−988ms), matches InternVL/Qwen. Single video sufficient (encode latency is
 video-length-independent at fixed frame count). All 5 models now live in ONE CSV
 `results/nextqa/reuse_real.csv` (LLaVA = 540 rows video-embeds; old image-embeds artifact
-purged). Figures in `results/nextqa/{model}/`. **Qwen3-VL: video-embeds inject now RUNS** with
-timestamps(nested `[[...]]`, len==grid_thw[0]) + DeepStack embeds dim `HID*(1+3)=16384`
-(deepstack_visual_indexes=[8,16,24]) — but cold/vt n_vis MISMATCH (Qwen3 spatial-merges video:
-cold counts raw 1760 vs vt merged 440) so fair comparison needs n_vis reconciliation → DEFERRED.
+purged). Figures in `results/nextqa/{model}/`. **Qwen3-VL: vt_reuse RESOLVED 2026-06-07 — NO
+vLLM patch** (it was a `reuse_real.py` construction bug, not vLLM). The cold/vt n_vis "mismatch"
+was: 1760 is CORRECT (grid_t=8), vt's 440 was wrong (metadata-less proc re-sampled to grid_t=2).
+3 fixes in the vt-inject branch: `video_metadata`+`do_sample_frames=False` on proc(), embeds dim
+16384 (DeepStack `out_hidden_size*(1+3)`), NESTED timestamps `[[...]]` (batched("video") field).
+Validated H100: vt<cold @16f (152<204, n_vis 1760) & @64f (524<1059, n_vis 7040). **Qwen3 NOT yet
+in production CSV** (clean slate, no purge) — run the full sweep like the other 5 models.
+
+**DONE (2026-06-07, all 6 models complete):** cost sweep unified to **x-axis = measured n_vis** for
+ALL 6 models (justified: encode/prefill/decode/KV all ∝ n_vis, resolution-independent — verified).
+- **Qwen3-VL-8B sweep DONE** → results/nextqa/reuse_real.csv (3375 rows; cold/kv_reuse/vt_reuse;
+  frames 16/32/64/128 × batch 1/4/8/16; cold==vt n_vis aligned; 128f=19200 confirms longest_edge
+  override worked in production). Run via `scripts/run_qwen3_2pass.sh` (`--qwen3-longest-edge` default
+  154M lifts the 12288 saturation; `--max-num-batched-tokens 32768`). Backup: reuse_real.csv.bak_pre_qwen3.
+- **All 6 models now in results/nextqa/reuse_real.csv**: internvl 4b/8b/14b, llava-ov-7b, qwen2.5-vl-7b,
+  qwen3-vl-8b. **Figures (11 each) in results/nextqa/{TAG}/** where TAG = internvl4b/8b/14b, llavaov,
+  qwen25, qwen3vl8b (NOTE: TAG ≠ model-key; see fig_internvl8b.py TAG map).
+- **Feasibility: 5 models done** (results/feasibility.csv): internvl 4b/8b/14b + llava + **qwen2.5-vl-7b**
+  (b1/4/8/16/32; all ~112f context-bound at 40960, small 56KB KV like LLaVA → fits high batch). **Qwen3
+  feasibility SKIPPED (moot — n_vis is our longest_edge knob, never token-OOMs).** `feasibility.py` fixed:
+  real n_vis count, ctx capped MML_CAP=40960, VID=vid_1280x720.csv. (Qwen3 stray junk rows purged;
+  capped 1280x720 SATURATES Qwen3 n_vis ~12k so it's only valid for Qwen2.5 there.)
+- **Break-even** (`analyze/breakeven_reuse.py --csv results/nextqa/reuse_real.csv`): all 6 models,
+  tiers local_nvme + s3_same_region, gpu-stall on/off. On these egress-free tiers N* is low (vt~1.0,
+  kv~1.3-1.9/mo) → reuse ~always wins. Outputs: /tmp/breakeven_{all,nostall}.txt (regenerate as needed).
 
 vLLM PATCH (jylim env only, backup kept): `llava_onevision.py` gained a video_embeds path.
 Final numbers come from this patched vLLM; revert via `*.bak_videoembeds` if needed.
@@ -532,3 +644,57 @@ Re-run LLaVA: `CUDA_VISIBLE_DEVICES=1 scripts/run_llava_ve.sh` (1 video, 16–12
 
 Before any GPU run: confirm H100 (GPU 1) idle (shared w/ `ljh`,`chani227`), `CUDA_VISIBLE_DEVICES=1`,
 `conda activate vlmcost`. After a vLLM job: reap the orphan `VLLM::EngineCore` (Section 2).
+
+---
+
+## 11. LMCache validation + pre-projector vt_reuse — CURRENT DIRECTION (2026-06-09)
+
+The measurement pivoted to a **3-way comparison, ALL real-measured in vLLM TTFT** (no analytical skips):
+1. **cold** = vLLM full recompute (encode + prefill + decode).
+2. **kv_reuse** = **LMCache**-based (real KV offload to a tier + reload; the retrieval §7 used to COMPUTE is now MEASURED).
+3. **vt_reuse** = **vLLM-based, PRE-projector** (reuse the vision ENCODER/ViT output → skip ViT, RE-RUN the cheap projector) — or **POST-projector via EC** where pre is impossible (Qwen3 DeepStack).
+
+### Per-model vt_reuse assignment
+- **PRE-projector** (skip ViT, run projector): InternVL-4B/8B/14B, LLaVA-OV-7B, Qwen2.5-VL-7B.
+- **POST-projector via EC** (skip whole tower): Qwen3-VL-8B — DeepStack taps mid-ViT layers so pre-projector is ill-defined.
+
+### Environments (version friction — READ before running)
+- **Use `vlmcost`** (vLLM 0.22 / torch 2.11 / transformers 5.9): **lmcache 0.4.6 installed here and its c_ops loads clean**. KV + EC + pre-projector all run here = SAME engine as reuse_real → **zero version confound**.
+- A separate `lmcache` conda env (vLLM 0.18 / torch 2.10 / lmcache 0.4.4) exists from the first KV test but is now SECONDARY — upgrading it to 0.4.6 BREAKS (torch-2.10 c_ops ABI `undefined symbol`; lmcache 0.4.6 needs transformers≥5.4 vs vLLM-0.18's 4.5x). Prefer vlmcost.
+- **GPU0/Blackwell is BLOCKED for LMCache** — prebuilt c_ops has no sm_120 kernel (`cudaErrorNoKernelImageForDevice`). LMCache work (KV & EC) is **H100-only**. (Pre-projector preproj_vllm.py is plain vLLM → GPU0 would work, but keep on H100 for consistency.)
+
+### kv_reuse = LMCache — `measure/reuse_lmcache.py`
+`--mode {lmcache(KV)|ours|ec}`, `--tier {dram|disk}`, isolated → `results/lmcache/`. KV connector `LMCacheConnectorV1` via `kv_transfer_config`. **`enable_prefix_caching=False` forces a REAL tier load** (else KV is GPU-resident → log shows `need to load: 0` = GPU hit, not tier retrieval).
+- **VALIDATION RESULT:** our COMPUTED-then-measured retrieval term `h2d_kv` (reuse_real 0.22: 3.2/6.5/12.9/25.9ms @16/32/64/128f) ≈ LMCache's REAL DRAM KV load (3.8/7.4/14.9/29.6ms), both ~45–52 GB/s. → **our kv_reuse retrieval model is validated by a real system.** (`Report_lmcache.md` + `analyze/lmcache_compare.py` fig.)
+- disk(NVMe) tier HANGS with GDS+forced-spill → retry `LMCACHE_USE_GDS=False`. DRAM tier works.
+
+### vt_reuse EC (encoder cache) — what vLLM vs LMCache provide
+vLLM ships the EC FRAMEWORK (`vllm.distributed.ec_transfer`: ECConnectorBase + ECExampleConnector[disk toy] + factory) in 0.22/main. LMCache adds the production EC backend (`lmcache...vllm_ec_adapter.LMCacheECConnectorImpl` + `ECCacheEngine`, tiered). The vLLM-side bridge `LMCacheECConnector` is in **UNMERGED vLLM PR #38668** → vendored into OUR repo at `measure/lmcache_ec_connector.py`, pointed to via `ec_connector_module_path="measure.lmcache_ec_connector"` (factory falls back to it for unregistered names → **NO vLLM source edit**; needs PYTHONPATH=repo for the worker). EC caches the POST-projector tower output keyed by vLLM **mm_hash**. **CRITICAL: do NOT set `mm_processor_cache_gb=0` for EC** — that yields positional mm_hash (`renderer0-mm-N`) → never hits; default mm cache gives a content hash → warm hits & skips the tower. Qwen3 EC verified: warm≪cold (16/32/64f: 77/149/318 vs 210/508/1097ms), `EC put` stores n_vis×16384(DeepStack)×2 bytes.
+
+### vt_reuse PRE-projector — `measure/preproj_vllm.py` (REAL vLLM, NO source edit)
+Run engine **IN-PROCESS** (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) so a main-process monkeypatch reaches the model, + **`mm_processor_cache_gb=0`** so vision REALLY re-runs each generate (opposite of EC! else the repeat hits the in-engine mm cache → all modes look identical). Per-model monkeypatch on the encoder→projector split, branched by env `VLM_REUSE_MODE`:
+- **cold** = original (ViT + projector); **pre** = random ViT-output → run projector → prefill (skip ViT only); **post** = random post-projector embeds → prefill (skip ViT + projector).
+- Patchers (PATCHERS registry): InternVL `extract_feature` (vision_model→pixel_shuffle→mlp1); LLaVA `_video_pixels_to_features` (vision_tower→multi_modal_projector→apply_pooling); Qwen2.5 `Qwen2_5_VisionTransformer.forward` (skip blocks loop, keep merger + reverse_indices; ctx=`merger.ln_q.weight.shape[0]`, d_model=`merger.mlp[-1].output_size` — both vLLM RMSNorm/ParallelLinear, NOT nn.Linear). Qwen3 NOT patchable (DeepStack) → EC.
+
+### KEY FINDINGS (REAL vLLM TTFT, verified InternVL-8B / LLaVA / Qwen2.5)
+- **pre ≈ post at all n_vis** (projector/merger is NEGLIGIBLE): cold−pre = ViT(encoder) cost (InternVL 51–376 / LLaVA 40–145 / Qwen2.5 63–229 ms over 16–128f); pre−post ≈ 0 (±7ms). → **switching vt_reuse post→pre does NOT change cost/break-even.**
+- The ONLY reason to prefer PRE-projector is **cross-model sharing**: InternVL-4B/8B/14B share the SAME InternViT → ViT (pre-projector) features are reusable ACROSS models; post-projector embeds are LLM-specific (not shareable). This is the long-term angle (esp. with the two 30B MoEs).
+- EC ≈ our old inject (LLaVA EC 119/247/522/1199 vs inject 123/249/596/1357ms) → inject was a faithful proxy; prior reuse_real vt numbers stand.
+
+### TCO changes (2026-06-09, going forward)
+- **Reflect the encoder-output vs projector-output BYTE difference**: vt_reuse stores the **ENCODER output (pre-projector)** for InternVL/LLaVA/Qwen2.5 — different bytes than post-projector (e.g. InternVL pre = 1025 tok × 1024-dim/tile vs post = 256 × llm_hidden). Qwen3 vt = post-projector (EC) → projector bytes (16384-dim DeepStack).
+- **GPU-stall cost EXCLUDED** (`--no-gpu-stall`, resource_price=0 = retrieval overlapped with compute).
+- **S3 object storage ONLY** for TCO requests for now (drop local_nvme).
+
+### Files (this phase — all isolated under results/lmcache/)
+- `measure/preproj_vllm.py` — ***PRIMARY vt_reuse*** (cold/pre/post real vLLM TTFT; InternVL/LLaVA/Qwen2.5 patchers).
+- `measure/lmcache_ec_connector.py` — vendored vLLM PR #38668 EC connector (repo-local; no vLLM edit).
+- `measure/reuse_lmcache.py` — ***kv_reuse*** (LMCache KV) + `--mode ec/ours`.
+- `measure/smoke_lmcache.py` (KV smoke), `measure/smoke_ec_qwen3.py` (Qwen3 EC smoke), `measure/preproj_internvl.py` (transformers stage-split, SUPERSEDED by preproj_vllm).
+- `analyze/lmcache_compare.py` + `Report_lmcache.md` — kv_reuse validation figure + report.
+- `results/lmcache/` — reuse_lmcache.csv (KV/ours), reuse_ec.csv (EC), preproj_vllm.csv (cold/pre/post), lmcache_retrieve_dram.csv, fig_lmcache_compare.png.
+
+### TODO (next)
+- InternVL-4B/14B pre-projector quick verify (same internvl patcher; deferred 2026-06-09).
+- Full cold/vt/kv sweep for the production 5(+Qwen3) models → TCO with the encoder-byte / no-stall / S3-only changes.
+- 30B MoE (InternVL/Qwen) measurement (long-term).

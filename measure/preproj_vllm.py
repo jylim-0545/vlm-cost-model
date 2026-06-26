@@ -169,6 +169,9 @@ def main() -> None:
     ap.add_argument("--video-max-patches", type=int, default=768, help="Qwen per-frame max_pixels = N*28*28")
     ap.add_argument("--video-min-patches", type=int, default=128)
     ap.add_argument("--qwen3-longest-edge", type=int, default=768 * 28 * 28 * 256)
+    ap.add_argument("--no-eager", action="store_true",
+                    help="enable torch.compile + CUDA graphs on the LLM (encoder stays eager -> patch still fires). "
+                         "Faster/realistic prefill+decode; verify the [patch] FIRED line still appears.")
     ap.add_argument("--csv", default="results/final/preproj_vllm.csv")
     a = ap.parse_args()
 
@@ -199,7 +202,7 @@ def main() -> None:
     elif fam == "qwen3":
         mm_kwargs = {"size": {"longest_edge": a.qwen3_longest_edge, "shortest_edge": 4096}}
     common = dict(model=spec.repo_id, trust_remote_code=spec.trust_remote_code,
-                  max_model_len=a.max_model_len, gpu_memory_utilization=0.85, enforce_eager=True,
+                  max_model_len=a.max_model_len, gpu_memory_utilization=0.85, enforce_eager=not a.no_eager,
                   enable_prefix_caching=False, mm_processor_cache_gb=0, mm_processor_kwargs=mm_kwargs,
                   max_num_seqs=max(a.batches), max_num_batched_tokens=a.max_num_batched_tokens,
                   limit_mm_per_prompt={"video": 1})

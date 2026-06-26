@@ -748,3 +748,98 @@ variant,metric).
 
 Launch: `nohup bash scripts/run_final.sh > results/final/run.log 2>&1 &`. Prior results archived to
 `results/_archive/pre_final_20260609/`.
+
+---
+
+## 13. CORRECTED cost model — GPU preprocess + clean prefill + pre-projector bytes (2026-06-11)
+
+The §12 measurement had a **methodology bug**: vt_reuse (preproj `mm_processor_cache_gb=0`) re-ran the
+**pixel preprocessing** every generate, so the measured vt TTFT WRONGLY included CPU preprocess. Real
+vt_reuse loads stored vision tokens → skips video-decode + preprocess + encoder entirely. Also the
+"baseline" preprocessing was unoptimized single-thread CPU. Both fixed this phase.
+
+### Corrected per-variant TTFT composition (this is the model now)
+```
+cold      = GPU_decode+preprocess(video) + encode(ViT) + prefill   (+ decode for full)
+vt_reuse  = prefill                       (skips dec+prep+encode; loads stored encoder output) + H2D(token bytes)
+kv_reuse  = kv_warm (LMCache)             (skips encode+prefill)                               + H2D(kv bytes)
+decode/TPOT = common to all (variant-independent) -> CANCELS in break-even N*, present in absolute TCO.
+```
+
+### Video decode + pixel preprocess can be GPU (NVDEC) — and SHOULD be the baseline
+- vLLM-default preprocessing is CPU single-thread (HF/PIL): **~1094 ms InternVL / 1372 ms Qwen2.5 @128f**
+  (measured), and video decode (decord CPU, outside generate) ~410 ms (360p). These DOMINATE a CPU-pipeline
+  TTFT but are an **implementation artifact**, NOT fundamental.
+- **GPU pipeline (NVIDIA DALI NVDEC decode + GPU resize/normalize, fused) = ~33–35 ms** (360p, 128f),
+  ~45× vs CPU; resize/normalize ≈ 0 on GPU (NVDEC-fused). Per-video (resolution-dependent): 360p 38 / 720p
+  159 / 1080p 264 / 4K 646 ms @128f (`results/final/gpu_decode_preprocess.csv`). Frames stay on GPU →
+  **no pixel CPU→GPU H2D** for cold.
+- KEY FINDING: with GPU dec+prep, **PREFILL (LLM over n_vis vision tokens) DOMINATES TTFT, NOT the ViT
+  encode** (InternVL-8B 128f: prefill 85% / ViT 13% / dec+prep 1%; Qwen2.5 prefill 62% / ViT 35%). So
+  "vision encode dominates" is false; the fundamental cost is the vision-token prefill (kv_reuse's lever).
+  ViT(encode) only dominates under aggressive pruning + heavy-encoder model (Qwen2.5/3, prune≤25%).
+
+### H2D = retrieval of REUSED state, byte-based; cold gets none
+cold: NVDEC keeps frames on GPU → H2D≈0. vt: H2D = token_bytes / BW_h2d (~50 GB/s measured); kv: kv_bytes /
+BW_h2d. + storage→DRAM network (§7). So §7's h2d_tok/h2d_kv are the reuse retrieval hop; cold has no H2D.
+
+### Stage-split measurement — `measure/stage_probe_all.py` (mm_cache=0, DEDUP-VERIFIED)
+Hooks each model's vision-tower fn (InternVL `extract_feature` / LLaVA `_video_pixels_to_features` /
+Qwen2.5,3 `*_VisionTransformer.forward`) with CUDA events → `pre`(generate→vision = preprocess+sched),
+`vis`(encode=ViT+projector), `prefill = ttft − pre − vis`, TPOT. In-process, eager (`VLLM_ENABLE_V1_
+MULTIPROCESSING=0`, `enforce_eager`). **⚠️ MUST use `mm_processor_cache_gb=0`** — with mm cache ON, a batch
+of B IDENTICAL videos shares one content-hash → vLLM **dedups the encoder** (ViT runs 1×, not B×) →
+per-request ViT/prefill undercounted B×. Verified clean via the **input-patch count == B-scaled** check
+(printed per row). Results: `results/final/stage_probe_all.csv` (4 models × frames{16,32,64,128} ×
+batch{1,4,8,16}, PIN nextqa video). encode ∝ n_vis (linear); prefill super-linear (~n_vis^1.2); both flat
+per-request across batch (compute-bound). Decode amortizes (TPOT b1→b16 ~9.8→1).
+
+### pre-projector byte convention — vt stores the ENCODER output (cross-model sharing)
+`measure/projector_bytes.py` hooks the projector module, measures its INPUT numel (= encoder output vt
+stores). **MEASURED bytes / post-vision-token (bf16):** InternVL-8B **8192** (==post; pixel_shuffle
+preserves numel), LLaVA-OV **8569**, Qwen2.5 **10240**, Qwen3 **8192** (pre-projector ill-defined under
+DeepStack → keep existing post-to-LLM; EC actually stores 16384-dim but we DON'T use that for storage).
+Table in `analyze/corrected_loader.PRE_BPT`. KV bytes unchanged (§3). storage = PRE_BPT[model] × n_vis.
+
+### latency vs cost convention (don't mix) — see [[ttft-latency-vs-cost-convention]] memory
+- **TTFT timeline / breakdown figures = per-query LATENCY = batch wall**: compute-bound stages (ViT,
+  prefill) and shared-link retrieval scale ×B; decode(TPOT) amortizes sub-linearly. So b8 TTFT ≈ 8× b1.
+- **§7 break-even / TCO ($) = per-request ÷B** (resource-seconds shared across batch). N* uses front-cost
+  saving (decode cancels). storage rent DOMINATES the TCO intercept (F ≪ storage at R≈49mo).
+
+### Corrected pipeline + artifacts (all FINAL-based, NOT archive)
+- `analyze/corrected_loader.load_corrected()` — builds load_reuse-shape recs from stage_probe_all +
+  gpu_decode_preprocess + final preproj(decode) + final reuse_lmcache(kv). cold_ttft = dec_prep+encode+
+  prefill; tok_inject = prefill; PRE_BPT storage bytes; h2d byte-based. **All corrected figures use this.**
+- `analyze/fig_final.py` — per-model fig1–8 suite (corrected). `--source final`.
+- `analyze/fig8_breakdown.py` (`--source final`), `fig8_batch_sweep / fig8_crossover / fig8_frames.py` —
+  per-query-latency TTFT breakdowns (10Gbps, pruning, KV÷4.3/vt÷16 compression I/O-only).
+- `analyze/fig_timeline_qwen_gpu.py` — Gantt timeline (Qwen2.5 full/prune25 × b1/b8), GPU pipeline.
+- `analyze/fig_combined.py` + `export_figA_data.py` — figA (3-panel TCO) + **Excel CSVs** in
+  `results/final/figA_data/` (panelA cumulative TCO, panelB per-model saving%, panelC pruning saving%,
+  summary_scalars). Op point f128/b8, S3, GPU-stall OFF, R=median age (~49mo).
+- Corrected break-even N* (S3, retr=0, prune25): InternVL 8.2 / LLaVA 7.5 / Qwen2.5 4.6 / Qwen3 5.3. vt N*
+  barely moved vs §12 (preprocess vt now skips is cheap on GPU); kv N* rose (cheaper GPU baseline saves less).
+
+### Env (GPU video decode enabled 2026-06-11) — see [[gpu-preprocess-prefill-dominates]] memory
+DALI 2.1.0 (pip, vlmcost). NVDEC needs `libnvcuvid.so` from driver pkg — installed `libnvidia-decode-595`.
+That pulled the `-0ubuntu0.24.04.1` driver branch which conflicted with the installed `-1ubuntu1` branch and
+broke driver pkg state; RECOVERED by completing migration to the -595 branch (dpkg --force-overwrite firmware
++ apt -f install + nvidia-utils-595 + nvidia-dkms-595 → DKMS rebuilt+signed modules for kernels 71/111/124,
+reboot-safe). LESSON: match the INSTALLED driver branch version when adding a driver sub-package. DALI runs
+need `LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` + `CUDA_VISIBLE_DEVICES=1` (DALI device_id=0 = H100).
+
+### New measure/ + analyze/ files this phase
+`measure/`: stage_probe_all.py (4-model stage split, PRIMARY), stage_probe.py (InternVL), stage_table_qwen.py,
+stage_breakdown_qwen.py, projector_bytes.py. `analyze/`: corrected_loader.py (PRIMARY corrected data),
+fig_final.py, fig8_breakdown.py, fig8_batch_sweep.py, fig8_crossover.py, fig8_frames.py,
+fig_timeline_qwen_gpu.py, fig_combined.py, fig_cumulative_tco.py, fig_prune_saving.py, export_figA_data.py.
+Result CSVs under `results/final/`: stage_probe_all.csv, gpu_decode_preprocess.csv, projector_bytes.csv,
+figA_data/*.csv.
+
+### TODO (next)
+- Apply corrected loader to `tco_workload.py` / `tco_report.py` (workload TCO over total_vpm.csv) + fig_
+  cumulative_tco / fig_prune_saving (still need final-based confirmation).
+- MLVU dataset corrected figures (per-video dec+prep already measured for the 6 final videos).
+- decode TPOT at high batch is noisy (decode-tokens=32 in stage probe) — re-measure with longer decode if
+  decode-share figures matter.

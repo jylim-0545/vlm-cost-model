@@ -1,0 +1,13 @@
+# Packages for pruning/ — runs entirely in this repo's vlmcost/vLLM env
+# (transformers 5.9; transformers 4.57.6 also verified). See README "실행 환경".
+#
+# cost / tests  (cost.py, demo_cost.py, test_methods.py):
+#   GPU·model 불필요. repo 기본 의존성만 — PyYAML(config) + torch(test_methods). 추가 설치 없음.
+#
+# scoring / real-model demos  (methods.py, demo_latency.py, demo_accuracy.py): GPU 필요.
+#   아래는 vlmcost 에 이미 있는 것들(transformers/torch/pillow/numpy).
+transformers>=4.57       # 4.57.6 / 5.9 모두 동작 (eager_attention_forward 패치 + feats 버전 적응)
+torch>=2.4
+pillow
+numpy
+# + 모델 체크포인트(HF 캐시): 예) OpenGVLab/InternVL3_5-8B-HF

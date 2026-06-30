@@ -64,6 +64,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--forget", default=None, choices=[None, "aokvqa", "mmstar"],
                     help="also eval this OTHER task (forgetting)")
+    ap.add_argument("--load-adapter", default=None,
+                    help="eval a PRE-TRAINED study adapter (.pt: {state_dict,xm,xs,adapter,MLP_H}) "
+                         "instead of training — e.g. EfficientVLM/logs/d6_B_fine_recon_s0_adapter.pt")
     ap.add_argument("--mmstar-tsv", default=MMSTAR_TSV)
     ap.add_argument("--nextqa-csv", default=NEXTQA_CSV)
     ap.add_argument("--nextqa-dir", default=NEXTQA_DIR)
@@ -75,9 +78,15 @@ def main() -> None:
                            pre_samples=a.pre_samples, sched=a.sched, n_eval=a.n_eval, seed=a.seed)
     share = HubShare(a.backbone)
     task = _make_task(a.task, a, n_train=a.n_train)
-    mt = _make_task(a.multitask, a, n_train=a.n_train) if a.multitask else None
     tr = AdapterTrainer(share, cfg)
-    res = tr.run(task, multitask=mt)
+    if a.load_adapter:
+        from sharing.adapters import load_study_adapter
+        ad, kind = load_study_adapter(a.load_adapter)
+        print(f"[load] {a.load_adapter}  (kind={kind})", flush=True)
+        res = tr.evaluate(ad, task)
+    else:
+        mt = _make_task(a.multitask, a, n_train=a.n_train) if a.multitask else None
+        res = tr.run(task, multitask=mt)
     if a.forget:
         f = tr.forgetting(_make_task(a.forget, a))
         print(f"  forgetting on {f['task']}: adapter={f['adapter_acc']:.1f}% "

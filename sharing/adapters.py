@@ -164,6 +164,26 @@ def save_adapter(adapter: nn.Module, path: str, **meta) -> None:
     torch.save(blob, path)
 
 
+def load_study_adapter(path: str, map_location: str = "cpu") -> tuple[nn.Module, str]:
+    """Load an adapter trained by the EfficientVLM token-sharing study (the d6/d12 save
+    format: ``{state_dict, xm, xs, adapter, MLP_H}``) into a sharing adapter, so the
+    pre-trained "raw / mlp_recon / mlp_e2e" weights can be re-evaluated through this module
+    WITHOUT retraining. Returns (adapter, kind). Distinguishes affine (state_dict has W/b)
+    from MLP (net.0/net.2) automatically."""
+    blob = torch.load(path, map_location=map_location, weights_only=False)
+    sd = blob["state_dict"]
+    mean, std = blob["xm"].float(), blob["xs"].float()
+    kind = blob.get("adapter", "?")
+    if "W" in sd:                                          # affine (raw / ridgeaffine)
+        return RidgeAffine(mean, std, sd["W"], sd["b"]), kind
+    H, din = sd["net.0.weight"].shape                      # ZScoreMLP (mlp_recon / mlp_e2e)
+    dout = sd["net.2.weight"].shape[0]
+    ad = ZScoreMLP(din, H, dout)
+    ad.load_state_dict({k: v for k, v in sd.items() if k.startswith("net.")}, strict=False)
+    ad.set_stats(mean, std)
+    return ad, kind
+
+
 def load_adapter(path: str, map_location: str = "cpu") -> tuple[nn.Module, dict]:
     """Inverse of `save_adapter`. Rebuilds the module from saved shapes, loads weights,
     returns (adapter, meta)."""

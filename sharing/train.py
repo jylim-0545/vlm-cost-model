@@ -410,6 +410,18 @@ class AdapterTrainer:
         self._adapter = ad
         return out
 
+    def evaluate(self, adapter, task: Task) -> dict:
+        """Eval a PRE-FIT adapter (e.g. loaded via adapters.load_study_adapter) vs native —
+        no training. Lets the study's saved adapters be verified through this module."""
+        adapter = adapter.to(self.share.device).float()
+        acc_a, acc_n, n = self._accuracy(adapter, task)
+        rec = acc_a / acc_n if acc_n else float("nan")
+        print(f"\n=== eval-only / {task.name} (n={n}) ===")
+        print(f"  adapter = {acc_a:.1f}%   native = {acc_n:.1f}%   recovery = {rec:.3f}", flush=True)
+        self._adapter = adapter
+        return {"mode": "loaded", "backbone": self.share.backbone, "task": task.name,
+                "adapter_acc": acc_a, "native_acc": acc_n, "recovery": rec, "n": n}
+
     def forgetting(self, other: Task) -> dict:
         """Eval the LAST-trained adapter on a held-out OTHER task vs native (forgetting)."""
         acc_a, acc_n, n = self._accuracy(self._adapter, other)

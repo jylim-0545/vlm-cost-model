@@ -1,112 +1,180 @@
-# Vision-token 공유 — 누적 결과 (FINDINGS)
+# Vision-token 공유 — 실험 결과 정리
 
-EfficientVLM token-sharing 연구(`REPORT_VTOKEN_UNIFY.md`, `scripts/{e1_stagea,d6_adapteronly,
-d12_holistic,d10_unified}.py`)의 결과를 이 모듈 용어로 정리한 문서. `sharing/`의 `train.py`·
-`cost.py`가 무엇을 재현·계산하는지 한곳에서 본다.
+## 왜 하는가 (우리 토큰-저장 작업과의 연결)
 
-> **수치 읽는 법**: MMStar 절댓값은 seed별 51~57로 흔들린다(eval n=400, 1~2pt는 노이즈). 반면
-> **회복률 = adapter/native 는 0.90±0.02로 안정적**이라(둘이 같이 흔들려 비율은 일관) 보고는 회복률
-> 기준으로 한다.
+우리는 vision 토큰을 저장해 두고 재사용해서 인코딩을 건너뛴다. 문제는 **VLM마다 vision 토큰이
+달라서**, 저장해 둔 토큰은 그걸 만든 모델 하나에만 쓸 수 있다는 점이다.
 
-## 셋업
+그래서 던진 질문: **이미지를 공용 인코더(hub) 하나로 한 번만 인코딩해 두고, 모델별로 작은
+변환기(adapter)만 거치면 여러 VLM이 그 한 벌을 같이 쓸 수 있을까?** 된다면 캐시 한 벌로 여러
+모델을 서빙할 수 있다. 단, 이건 **정확도가 버텨줘야** 의미가 있으므로, 이 문서는 "공유+변환한
+토큰이 각 백본의 원래(native) 정확도를 얼마나 회복하는가"를 정리한다. (비용 정량화는 이 모듈
+범위 밖 — §7.)
 
-- **hub**: stock SigLIP-so400m (1152-d, 384px당 729 토큰). 이미지당 1회 인코딩.
-- **백본**(전부 freeze): LLaVA-OV-7B(SigLIP 계열 = hub와 동일), InternVL3.5-8B/4B(InternViT, 1024-d),
-  Qwen2.5-VL-7B(자체 ViT, 1280-d). Qwen3는 구조상(deepstack+mrope) 제외.
-- **eval**: MMStar(fine, 이미지 4지선다) / NExT-QA·MLVU(holistic, 비디오). 답 letter logit argmax,
-  같은 문항을 모든 조건으로 채점(paired). **native** = 백본이 자기 토큰을 쓴 상한(어댑터와 동일 경로로 채점).
+용어가 낯설면 맨 아래 [용어](#용어) 먼저.
 
-## 1. 어댑터 사다리 (LLaVA-OV, reader frozen)
+## 공통 셋업
 
-| mode | 방법 | holistic 회복 | fine 회복 |
+- **hub** = stock SigLIP-so400m. 이미지(384px) 1장 → 토큰 729개 × 1152차원. 이미지당 1회 인코딩.
+- **백본(backbone)** = 실제로 답을 내는 VLM. 모든 실험에서 **백본은 고정(freeze)**, 변환기만 만진다.
+  - LLaVA-OV-7B: 인코더가 SigLIP → **hub와 같은 계열**. (대부분 실험의 기본 백본)
+  - InternVL3.5-8B/4B: 인코더 InternViT. Qwen2.5-VL-7B: 자체 ViT. → **hub와 다른 계열**.
+- **변환기(adapter)** = hub 토큰을 백본이 이해하는 토큰으로 바꾸는 작은 신경망. 네 가지를 비교한다
+  (raw / ridge / mlp_recon / mlp_e2e — §1에서 설명).
+- **평가셋**: MMStar(세밀 인식, 이미지, **4지선다** → random 25점, 만점 100) / NExT-QA·MLVU(영상
+  전체 이해, 비디오, 5지선다) / A-OKVQA(상식 VQA — "다른 과제" 역할). 보기 letter의 logit이 가장
+  큰 걸 답으로 고른다.
+- **native(원본)** = 백본이 자기 인코더로 만든 토큰을 쓴 경우 = **상한**. (MMStar에서 OV는 ~56점.)
+- **회복률** = `변환기 정확도 / native 정확도`. 1.0이면 공유해도 원본만큼. **절댓값은 표본에 따라
+  ±2~3점 흔들리므로(노이즈), 회복률(비율)로 본다.**
+
+---
+
+## 1. 변환기를 얼마나 정교하게 만들어야 하나 (회복 사다리)
+
+**질문.** hub 토큰을 백본에 넣을 때, 변환기를 얼마나 공들여야 native만큼 답하나?
+
+**세팅.** 백본 = LLaVA-OV(고정). 변환기 4종을 만들어 OV의 vision 토큰 자리에 넣고, native 대비
+정확도를 잰다. 변환기 학습용 데이터는 평가와 겹치지 않는 같은 데이터셋의 다른 샘플(MMStar는
+held-out ~400장, NExT-QA는 학습/평가 분리). 평가: MMStar n=400, NExT-QA n=200.
+
+| 변환기 | 만드는 법 | 영상 이해 회복 | 세밀 인식 회복 |
 |---|---|---|---|
-| **raw** | z-score한 hub 토큰 그대로 (학습 X) | **0.96** | **0.83** |
-| **ridge** | 닫힌 해 z-affine token-matching (label-free, 수초) | — | (fine은 raw보다 낮아 생략) |
-| **mlp_recon** | MLP를 native 토큰 MSE로 재현 사전학습 | 0.95 | **0.88** |
-| **mlp_e2e** | recon 후 VQA-CE 미세조정 (+recon-anchor, cosine) | 0.93 | **0.91** |
+| **raw** | 학습 없음. hub 토큰을 표준화만 해서 그대로 주입 | **0.96** | **0.83** |
+| **ridge** | (hub 토큰 ↔ OV 토큰) 쌍에서 선형변환을 공식으로 fit. 정답 라벨 불필요, 수초 | — | (세밀에선 raw보다 낮아 생략) |
+| **mlp_recon** | 2층 MLP를 그 쌍으로 "OV 토큰 흉내"(MSE)만 사전학습 | 0.95 | **0.88** |
+| **mlp_e2e** | mlp_recon 후, 정답(보기 letter)으로 추가 미세조정 (+ §3의 anchor·cosine) | 0.93 | **0.91** |
 
-- **holistic은 차원만 맞추면 됨**(raw 0.96, 학습 더해도 노이즈 내 이득 없음).
-- **fine은 학습 사다리**(raw 0.83 → recon 0.88 → e2e 0.91; 절댓값 47.8 → 49.2 → 53.0, native 56.2).
-- 동일 계열(OV)에선 raw(z-score 통과)가 ridge(재현 fit)보다 높다 — hub가 곧 OV의 SigLIP이라 그대로
-  넣는 게 낫다. ridge/recon은 차원·기하가 다른 cross-encoder에서 의미가 있다.
+**결과 해석.**
+- **영상 전체 이해는 차원만 맞추면 된다** — raw가 이미 0.96, 학습을 더해도 노이즈 안에서 이득 없음.
+- **세밀 인식은 학습 사다리** — raw 0.83 → recon 0.88 → e2e 0.91 (절댓값 47.8 → 49.2 → 53.0, native 56.2).
+- 같은 계열(OV)에선 raw(표준화 후 그대로)가 ridge(재현 fit)보다 낫다 — hub가 곧 OV의 SigLIP이라
+  그대로 넣는 게, 제한된 데이터로 OV 토큰을 재현하는 것보다 낫기 때문. ridge/recon은 차원·구조가
+  다른 백본에서 의미가 있다(§4).
 
-## 2. 미세조정 lr·스케줄 (recon 49.2에서 출발, MLP만 학습)
+---
 
-| step | lr 1e-5 | 3e-5 | 1e-4 | 3e-4 |
+## 2. e2e 미세조정의 학습률은 얼마가 좋은가
+
+**질문.** §1의 mlp_e2e에서 정답 미세조정을 세게 할수록 좋아지나?
+
+**세팅.** 출발점 = mlp_recon으로 사전학습된 변환기(이 시점 MMStar **49.2점**, 만점 100·random 25·
+native 56.2). 여기서 정답 학습을 **학습률 4종**으로 6600 step, **변환기만** 학습(백본 고정), 매
+600 step마다 MMStar를 측정. 표의 각 칸 = 그 시점 MMStar 점수.
+
+| step | 학습률 1e-5 | 3e-5 | 1e-4 | 3e-4 |
 |---|---|---|---|---|
 | 600 | 46.5 | 47.0 | 40.5 | 29.0 |
 | 6600 (최종) | 51.8 | **53.0** | 46.5 | 37.0 |
 
-작은 lr은 초기 dip 후 회복해 ~53 plateau(망가짐 아님). **3e-5가 53.0으로 adapter-only 최고**(native에
-3.2pt). 큰 lr(3e-4)은 망가져 회복 못 함. → `train.py`의 `--ft-lr`, `--sched cosine`, `--warmup`.
+**해석.** 작은 학습률(1e-5·3e-5)은 초반에 49.2보다 잠깐 떨어졌다가 회복해 ~53에서 안정된다(망가진
+게 아니라 적응 중). **3e-5가 최종 53.0으로 변환기-only 최고**(native에 3.2점 차). 큰 학습률(3e-4)은
+망가져 회복하지 못한다(37). → `train.py`의 `--ft-lr`, `--sched cosine`, `--warmup`.
 
-## 3. recon-anchor (forgetting 완화)
+---
 
-VQA-CE 손실에 `+ λ·‖adapter(hub) − nativeVT‖²`(λ=8) + cosine을 더하면, 다른 과제 forgetting이 14→6.3로
-줄면서 MMStar는 49.5→53.0으로 같이 오른다. anchor가 adapter 출력을 native에 묶어 일반성을 유지한다(EWC류).
-→ `--recon-lambda 8` (mlp_e2e 기본).
+## 3. 다른 과제 망각 — 한 과제로 학습하면 다른 과제가 나빠진다
 
-## 4. 인코더 계열 의존성 (fine 공유의 핵심)
+**질문.** 변환기를 한 과제(MMStar)로 학습하면 다른 과제(A-OKVQA)는 어떻게 되나? 줄일 수 있나?
 
-단일 hub + 경량 adapter, MMStar, reader frozen:
+**(a) recon-anchor.** 세팅: §1 mlp_e2e의 정답 학습 손실에 `+ λ·‖변환기(hub) − native‖²`(λ=8)와
+학습률 cosine 감쇠를 추가. 변환기 출력을 native에 붙들어 둔다. 결과: A-OKVQA 하락폭이 14 → 6.3으로
+줄면서 MMStar는 49.5 → 53.0으로 **같이** 오른다. → `--recon-lambda 8` (mlp_e2e 기본값).
 
-| 백본 | 인코더 | adapter / native | 회복률 |
+**(b) 여러 과제 함께 학습 (multi-task).** 세팅: OV 변환기 하나를 MMStar + A-OKVQA를 섞어 학습하고
+둘 다 평가.
+
+| 학습 방식 | MMStar (세밀) | A-OKVQA (다른 과제) |
+|---|---|---|
+| native (상한) | 56.2 | 97.3 |
+| MMStar만 학습 | 51.8 | 91.3 |
+| **함께 학습 (λ=2)** | 51.0 | **93.7** |
+| 함께 학습 (λ=8) | 49.8 | 93.7 |
+
+**해석.** 함께 학습하면 다른 과제 하락폭이 6.0 → 3.7로 줄고, 세밀은 약간 희생된다(맞교환). λ=2가
+균형. → `--multitask aokvqa` + `--forget aokvqa`(망각 측정).
+
+---
+
+## 4. 인코더 계열 의존성 — 세밀 공유의 핵심 한계
+
+**질문.** hub는 SigLIP인데, 인코더가 SigLIP이 아닌 백본도 세밀 인식까지 공유되나?
+
+**세팅.** 같은 hub + 백본별 변환기(세밀 MMStar로 학습, §1 e2e 레시피), 백본별 MMStar 회복을 측정.
+바뀌는 건 백본(=인코더)뿐.
+
+| 백본 | 인코더 | 변환기 / native | 회복률 |
 |---|---|---|---|
-| LLaVA-OV | SigLIP (hub와 동일 계열) | 53.0 / 56.2 | **0.94** |
-| InternVL-4B | InternViT | 45.2 / 60.0 | 0.75 |
-| InternVL-8B | InternViT | 40.8 / 58.8 | 0.67 |
-| Qwen2.5-VL | 자체 ViT | 39.8 / 60.8 | 0.65 |
+| LLaVA-OV | SigLIP (**hub와 같은 계열**) | 53.0 / 56.2 | **0.94** |
+| InternVL-4B | InternViT (다른 계열) | 45.2 / 60.0 | 0.75 |
+| InternVL-8B | InternViT (다른 계열) | 40.8 / 58.8 | 0.67 |
+| Qwen2.5-VL | 자체 ViT (다른 계열) | 39.8 / 60.8 | 0.65 |
 
-**fine 공유는 백본 인코더가 hub와 같은 계열일 때만 강하다.** holistic은 cross-encoder도 0.86~0.99로 무난.
+**해석.** **세밀 인식 공유는 백본 인코더가 hub와 같은 계열일 때만 강하다.** 영상 전체 이해는 다른
+계열도 0.86~0.99로 무난하다. → 캐시 관점에서: 공용 토큰 한 벌로 세밀까지 여러 모델을 덮으려면
+같은 인코더 계열끼리여야 하고, 다른 계열은 (현재로선) 영상 이해 수준에서만 공유된다.
 
-## 5. 언제 공유되나
+---
+
+## 5. 정리 — 언제 공유되나
 
 | 상황 | 공유? |
 |---|---|
-| holistic (영상) | ✅ 거의 무손실 (raw로 충분) |
-| fine, 동일 계열 (OV) | ⚠ 학습하면 됨 (mlp_e2e 0.91) |
-| 여러 과제 동시 | ⚠ trade-off (§6) |
-| fine, 다른 계열 (InternVL/Qwen) | ❌ 아직 (0.65~0.75) |
+| 영상 전체 이해 | ✅ 거의 무손실 (raw로 충분) |
+| 세밀 인식, 같은 계열 (OV) | ⚠ 학습하면 됨 (mlp_e2e 0.91) |
+| 여러 과제 동시 | ⚠ 맞교환 (§3) |
+| 세밀 인식, 다른 계열 (InternVL/Qwen) | ❌ 아직 (0.65~0.75) |
 
-## 6. 한 어댑터로 여러 과제 (multi-task trade-off)
+---
 
-OV 어댑터를 MMStar + A-OKVQA로 함께 학습:
+## 6. 주의 — 학습이 해롭거나 막히는 경우
 
-| 조건 | MMStar | A-OKVQA |
-|---|---|---|
-| native (상한) | 56.2 | 97.3 |
-| MMStar만 | 51.8 | 91.3 |
-| **multi λ=2** | 51.0 | **93.7** |
-| multi λ=8 | 49.8 | 93.7 |
+- **음의 전이.** 세팅: 선형변환을 A-OKVQA 정답으로 미세조정 후 MMStar 평가. 결과: MMStar 회복이
+  0.41 → 0.17로 **오히려 나빠진다**(엉뚱한 과제로 학습하면 손해). 그래서 mlp_e2e는 recon 사전학습 +
+  작은 학습률 + anchor를 함께 쓴다.
+- **재현 품질(R²) ≠ 정확도.** MLP는 native 토큰 재현 R²가 ridge보다 높아도(0.77 vs 0.42) MMStar는
+  더 낮다 — 분산 큰 차원에 과적합해 판별에 중요한 방향을 뭉갠다. 그래서 세밀 재현은 선형(ridge) ≥ MLP.
+- **재현 천장 ~0.20–0.25.** 변환기 형태·크기·데이터를 늘려도 hub→native 재현 R²는 여기서 막힌다.
+  단 R²≠정확도라 ridge(R²0.24)도 영상 이해는 0.9 회복 → 세밀 격차는 변환기가 아니라 hub의
+  정보/해상도(SigLIP-384) 한계 쪽이다.
 
-함께 학습하면 다른 과제 forgetting이 6.0→3.7로 줄고, fine은 약간 희생된다(trade-off). λ=2가 균형.
-→ `--multitask aokvqa` + `--forget aokvqa`.
+---
 
-## 7. 학습이 해로운 경우 / 재현의 한계
+## 7. 비용 측면 (정성, 정량화는 별도)
 
-- **음의 전이**: 엉뚱한 데이터로 E2E하면 오히려 나빠진다(A-OKVQA로 affine 미세조정 → MMStar 회복 0.41→0.17).
-  그래서 mlp_e2e는 recon 사전학습 + 작은 lr + anchor를 함께 쓴다.
-- **재현 R² ≠ 정확도**: MLP는 재현 R²가 ridge보다 높아도(0.77 vs 0.42) MMStar는 더 낮다 — 고분산 차원에
-  과적합해 판별 방향을 뭉갠다. 그래서 fine 재현은 선형(ridge) ≥ MLP.
-- **재현 천장 ~0.20–0.25**: 맵 형태·용량·데이터를 늘려도 SigLIP→native 재현 R²는 여기서 막힌다. 단
-  R²≠정확도라 ridge(R²0.24)도 holistic은 0.9 회복 → fine 격차는 hub의 정보/해상도(SigLIP-384) 문제다.
+공유가 캐시 비용에 좋은 이유는 둘이다: (1) N개 백본을 따로 인코딩하면 인코딩 N번이지만 hub 공유는
+**인코딩 1번 + 변환기 N개**이고, 변환기는 SigLIP ViT의 ~1% 연산이라(2층 MLP 6.88 GFLOPs vs ViT
+665 GFLOPs) 거의 공짜다. (2) 백본마다 토큰을 따로 저장하는 대신 **hub 토큰 한 벌만 저장**한다.
+정량 비용/break-even 모델링은 이 모듈 범위 밖이다(담당 분리).
 
-## 8. 비용 (이 모듈 `cost.py` 가 계산)
+---
 
-adapter(2-layer MLP)는 **6.88 GFLOPs·4.72M params = SigLIP ViT(665 GFLOPs·428M)의 ~1%**. 두 절감 축:
+## 출처
 
-- **(A) encode "1회·N개 서빙"**: N×ViT → ViT + N×adapter. N=4면 ~74% 절감.
-- **(B) 공용 TokenStore**: 백본마다 따로 저장(Σ bytes_i) → hub 1벌 저장. 3백본·64f에서 308→107MB(65%),
-  break-even N*≈1~2회/월. KV-reuse(`REPORT_KVREUSE`)의 "vision-token store가 cross-model에 유리"와
-  합쳐 시스템 논거가 된다(= 연구의 미완 제안 E4).
-- 주의: repo의 `6.88`(H100 $6.88/h)와 adapter 6.88 GFLOPs는 우연히 같은 숫자다.
-
-## 출처 ↔ 이 모듈
-
-| 연구 스크립트 | 이 모듈 |
+| 연구 스크립트 (EfficientVLM) | 이 모듈 |
 |---|---|
-| `e1_stagea.py` (ridge, cross-backbone) | `train.py` mode=ridge + `methods.py` embed 주입 |
-| `d6_adapteronly.py` (fine: affine/ridge/mlp/mlp_recon, anchor, multitask) | `train.py` (MMStar) + `aokvqa_task` |
-| `d12_holistic.py` (holistic 비디오: recon+E2E) | `train.py` (nextqa) |
+| `e1_stagea.py` (ridge, 다른-계열 백본) | `train.py` mode=ridge + `methods.py` embed 주입 |
+| `d6_adapteronly.py` (세밀: raw/ridge/mlp/recon, anchor, multi-task) | `train.py`(MMStar) + `aokvqa_task` |
+| `d12_holistic.py` (영상 이해: recon + e2e) | `train.py`(nextqa) |
 | `run_B.sh` / `smoke_B.sh` (3-seed sweep) | `sweep.py` / `smoke.sh` |
-| `REPORT_VTOKEN_UNIFY.md` L375 (FLOP/param) | `cost.py` 상수 + §8 |
+
+전체 맥락·추가 실험: `EfficientVLM/REPORT_VTOKEN_UNIFY.md`.
+
+---
+
+## 용어
+
+| 말 | 뜻 |
+|---|---|
+| **hub** | 모든 백본이 공유하는 단 하나의 vision 인코더(SigLIP). 이미지를 1회만 인코딩. |
+| **백본(backbone)** | 답을 내는 VLM. 학습 내내 고정(freeze). |
+| **변환기(adapter)** | hub 토큰을 특정 백본이 이해하는 형태로 바꾸는 작은 신경망. 이것만 학습. |
+| **native(원본)** | 백본이 자기 인코더로 만든 토큰. 비교 기준이자 상한. |
+| **회복률(recovery)** | 변환기 정확도 ÷ native 정확도. 절댓값보다 안정적이라 이걸로 본다. |
+| **raw** | 변환기를 학습하지 않고 hub 토큰을 표준화만 해서 그대로 주입. |
+| **ridge** | 표준화 후 선형변환을 공식(닫힌 해)으로 한 번에 푸는 fit. 라벨 불필요, 수초. |
+| **mlp_recon / mlp_e2e** | 2층 MLP 변환기. recon=native 토큰 흉내 사전학습만 / e2e=거기에 정답 학습까지. |
+| **recon-anchor (λ)** | 학습 중 변환기 출력을 native에 붙들어 두는 정칙항. 다른 과제 망각을 줄인다. |
+| **망각(forgetting)** | 한 과제로 학습한 변환기가 다른 과제 정확도를 떨어뜨리는 현상. |
+| **주입 방식** | hub 토큰을 백본에 넣는 법. `vtpatch`(같은 계열: vision-tower 출력 자리를 직접 교체) / `embed`(다른 계열: 차원 맞춰 토큰 자리에 끼워넣기). |
+| **R²** | 재현이 native 토큰을 얼마나 잘 맞췄는지(1이면 완벽). 단 R²가 높다고 정확도가 높진 않다(§6). |

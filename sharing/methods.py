@@ -22,7 +22,7 @@ Injection modes (per backbone):
 
 ENV: loads a real VLM + SigLIP on GPU (verified on the study's transformers 4.57 box,
 4×RTX 4090). torch/transformers/PIL are imported LAZILY (inside the constructor / methods)
-so `import sharing.methods` is cheap. The cost side (`sharing.cost`) needs none of this.
+so `import sharing.methods` is cheap (only constructing a HubShare loads the models).
 See sharing/README.md for which model/data paths are expected.
 """
 from __future__ import annotations

@@ -1,21 +1,21 @@
-"""Vision-token SHARING, ported from our token-sharing study, packaged for the cost model.
+"""Vision-token SHARING — reproduces our token-sharing experiment inside this repo.
 
-One shared SigLIP **hub** encodes an image once; a light per-backbone **adapter** maps the
-hub tokens into each frozen VLM backbone's vision-token space (hub-and-spoke). This module
-(1) PRICES that — "encode once, serve N" compute + canonical-TokenStore storage — as the
-cost model's E4 accounting, and (2) reproduces the adapter TRAINING (ridge / mlp_recon /
-mlp_e2e, multi-task) and the recovery-vs-native measurement.
+We cache vision tokens to skip re-encoding. But each VLM uses its own vision tokens, so a
+cache helps only one model. This module reproduces the study that asks: can ONE shared
+encoding (a SigLIP "hub") drive MANY frozen VLM backbones through a small per-backbone
+adapter? If so, one cached token set could serve several models. The deliverable here is
+the ACCURACY side — how well a shared+adapted token recovers each backbone's native
+accuracy (the cost side is handled separately).
 
 Layers, decoupled by dependency (see sharing/README.md):
 
-- `sharing.cost`     — encode/storage/break-even projection. PURE arithmetic (config byte
-                       math + tier costs). NO torch/transformers/GPU. Safe anywhere.
-- `sharing.adapters` — adapter modules + closed-form ridge fit. Pure `torch` (no model,
-                       no GPU needed); unit-testable on its own.
-- `sharing.methods`  — hub encoder + backbone injection (embed-splice / qwen-patch /
-                       vtpatch). Loads real VLMs on GPU; imports torch/transformers LAZILY.
-- `sharing.train`    — AdapterTrainer: ridge / mlp_recon / mlp_e2e (+ recon-anchor, cosine,
-                       multi-task) + recovery-vs-native eval. GPU.
+- `sharing.adapters` — adapter modules (`RidgeAffine`, `ZScoreMLP`) + closed-form ridge fit
+                       + a loader for the study's pre-trained adapters. Pure `torch`
+                       (no model, no GPU); unit-testable on its own.
+- `sharing.methods`  — `HubShare`: hub encoder + backbone load + injection patch. Loads
+                       real VLMs on GPU; imports torch/transformers LAZILY.
+- `sharing.train`    — `AdapterTrainer`: ridge / mlp_recon / mlp_e2e (+ recon-anchor,
+                       cosine, multi-task) + recovery-vs-native and forgetting eval. GPU.
 
-Importing this package (or `sharing.cost`) imports neither torch nor transformers.
+Importing this package does not import torch or transformers.
 """

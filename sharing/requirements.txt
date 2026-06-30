@@ -1,18 +1,15 @@
 # Packages for sharing/ — see README "실행 환경".
 #
-# COST / TESTS (cost.py, demo_cost.py, the cost half of test_adapters.py):
-#   GPU·모델 불필요. config 로더(PyYAML)만 필요. `import sharing.cost`는 torch도 안 끌어온다.
-#   adapters.py / test_adapters.py 의 어댑터 수학은 torch만 필요(CPU 가능).
+# TESTS / ADAPTER MATH (adapters.py, test_adapters.py): torch만 필요 (CPU 가능, GPU·모델 불필요).
 #
 # TRAINING / REAL-MODEL DEMOS (methods.py, train.py, demo_train.py, demo_latency.py, sweep.py):
-#   GPU 필요. 이 token-sharing 코드는 EfficientVLM 학습 박스(transformers 4.57.6, 4×RTX 4090)에서
+#   GPU 필요. 이 코드는 EfficientVLM 학습 박스(transformers 4.57.6, torch 2.6, 4×RTX 4090)에서
 #   검증됨 — 그 env(예: anaconda3/envs/vlmeval)에 아래가 이미 깔려 있다. 새로 설치하지 말 것.
-PyYAML            # config (cost.py)
-torch>=2.4        # adapters.py / methods.py / train.py  (검증: 2.6.0+cu124)
+torch>=2.4          # adapters / methods / train  (검증: 2.6.0+cu124)
 transformers>=4.57  # SiglipVisionModel + AutoModelForImageTextToText (검증: 4.57.6)
 pillow
 numpy
-pandas            # MMStar TSV / A-OKVQA parquet
-decord            # NExT-QA video frame sampling (holistic)
+pandas              # MMStar TSV / A-OKVQA parquet
+decord              # NExT-QA video frame sampling
 # + 체크포인트(HF 캐시): google/siglip-so400m-patch14-384,
-#   llava-hf/llava-onevision-qwen2-7b-ov-hf, (cross-encoder) OpenGVLab/InternVL3_5-{4B,8B}-HF
+#   llava-hf/llava-onevision-qwen2-7b-ov-hf, (다른 계열) OpenGVLab/InternVL3_5-{4B,8B}-HF

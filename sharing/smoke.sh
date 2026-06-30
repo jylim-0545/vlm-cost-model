@@ -9,9 +9,8 @@ L=logs/smoke_share
 mkdir -p "$L"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "=== GPU-free: unit tests + cost demo ==="
+echo "=== GPU-free: unit tests ==="
 python -m sharing.test_adapters
-python -m sharing.demo_cost >/dev/null && echo "  demo_cost OK"
 
 echo
 echo "=== GPU: 4 tiny trainer smokes (one per GPU) ==="

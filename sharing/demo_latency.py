@@ -1,20 +1,17 @@
-"""Measured latency breakdown for vision-token sharing (REAL model, GPU).
+"""Measure how cheap the adapter is vs the vision encoder (REAL model, GPU).
 
-Times, with cuda events on a real LLaVA-OV + SigLIP hub:
-  - native vision tower (the encoder a standalone backbone runs)   E_native
-  - shared SigLIP hub encode                                       E_hub
-  - the adapter apply (ridge affine and 2-layer MLP)               a
+Times, with cuda events on a real LLaVA-OV + SigLIP hub, the per-image latency of:
+  - the backbone's native vision tower (the encoder a standalone model runs)   E_native
+  - the shared SigLIP hub encode                                               E_hub
+  - the adapter apply (ridge affine, and 2-layer MLP)                          a
 
-and composes the cost model's "encode once, serve N" the way sharing.cost does:
-  baseline (no sharing) = N x E_native ;  shared = E_hub + N x a.
-This validates the report's "adapter ~1% of the ViT" and the ~74%@N=4 encode saving on
-real hardware, and prints a measured --hub-encode-ms to feed `sharing.demo_cost`.
+and reports the adapter as a % of the encoder. This is the empirical basis for "the adapter
+is ~1% of the ViT" — raw input for whoever models the serving cost; this module itself does
+NOT compute cost/break-even.
 
   CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_latency --backbone llavaov --runs 20
 
-The vt_reuse (skip-encode) latency win is the SAME mechanism the cost repo already measures
-for one model; sharing extends it across N backbones (encode amortized) — see sharing/cost.py.
-GPU + transformers (the study's 4.57 box). See sharing/README.md.
+GPU + transformers (the study's box). See sharing/README.md.
 """
 from __future__ import annotations
 
@@ -24,7 +21,7 @@ import argparse
 def main() -> None:
     import numpy as np
     from PIL import Image
-    from sharing import adapters, cost
+    from sharing import adapters
     from sharing.methods import HubShare
 
     ap = argparse.ArgumentParser(description=__doc__,
@@ -32,16 +29,13 @@ def main() -> None:
     ap.add_argument("--backbone", default="llavaov")
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--ns", default="1,2,4,8,16")
     a = ap.parse_args()
 
     share = HubShare(a.backbone)
     torch = share.torch
-    ns = [int(x) for x in a.ns.split(",")]
 
     img = Image.fromarray(np.random.randint(0, 255, (share.res, share.res, 3), dtype="uint8"))
-    inp = share.build(img, "x")
-    pv = inp["pixel_values"]
+    pv = share.build(img, "x")["pixel_values"]
 
     def cuda_ms(fn):
         for _ in range(a.warmup):
@@ -55,7 +49,7 @@ def main() -> None:
         ts.sort()
         return ts[len(ts) // 2]
 
-    # build adapters of each kind, fit on a single image's tokens (latency is content-free)
+    # adapters (latency is content-free, so fit on this one image's tokens)
     x = share.hub_on_pixels(pv).reshape(-1, 1152)
     y = share.native_vt_on_pixels(pv).reshape(-1, share.vt_dim)
     ridge = adapters.RidgeAffine.fit(x, y).to(share.device).float()
@@ -69,27 +63,14 @@ def main() -> None:
     a_ridge = cuda_ms(lambda: ridge(hub_tok))
     a_mlp = cuda_ms(lambda: mlp(hub_tok))
 
-    n_tok = x.shape[0]
-    print(f"\nlatency breakdown — {a.backbone}  (per image, {n_tok} hub tokens, "
+    print(f"\nadapter vs encoder latency — {a.backbone}  (per image, {x.shape[0]} hub tokens, "
           f"runs={a.runs}, cuda events)")
     print(f"  native VT encode   E_native = {e_native:7.2f} ms")
     print(f"  shared hub encode  E_hub    = {e_hub:7.2f} ms")
     print(f"  adapter (ridge)    a        = {a_ridge:7.3f} ms  ({100*a_ridge/e_native:.2f}% of E_native)")
     print(f"  adapter (mlp)      a        = {a_mlp:7.3f} ms  ({100*a_mlp/e_native:.2f}% of E_native)")
-
-    print(f"\n  encode 'once, serve N' — baseline N×E_native vs shared E_hub + N×a (mlp)")
-    print(f"  {'N':>4} {'baseline_ms':>12} {'shared_ms':>11} {'saving%':>9}")
-    for n in ns:
-        base = n * e_native
-        shared = e_hub + n * a_mlp
-        print(f"  {n:>4d} {base:>12.1f} {shared:>11.1f} {100*(base-shared)/base:>8.1f}%")
-
-    # FLOP-based cross-check + a measured hub-encode-ms for demo_cost
-    g4 = cost.encode_share(4)
-    print(f"\n  (FLOP model: adapter {cost.ADAPTER_MLP_GFLOPS:.2f} GFLOPs = "
-          f"{100*cost.ADAPTER_MLP_GFLOPS/cost.HUB_VIT_GFLOPS:.1f}% of ViT; N=4 saving "
-          f"{100*g4['saving_frac']:.0f}%)")
-    print(f"  feed measured value:  python -m sharing.demo_cost --hub-encode-ms {e_hub:.1f}")
+    print("\n  → the adapter is a tiny fraction of one ViT encode; sharing one hub across N "
+          "backbones replaces N encodes with 1 encode + N (cheap) adapters.")
 
 
 if __name__ == "__main__":

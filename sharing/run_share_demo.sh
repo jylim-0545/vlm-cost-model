@@ -24,9 +24,9 @@ e.g. conda env vlmeval). Pick a free GPU with CUDA_VISIBLE_DEVICES.
   CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task nextqa --mode raw       --frames 4 --n-eval 200
   # multi-task (trade-off + forgetting):
   CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task mmstar --mode mlp_e2e --multitask aokvqa --recon-lambda 8 --forget aokvqa
-  # re-evaluate a pre-trained adapter (no training):
+  # re-evaluate a shipped pre-trained adapter (no training; run `git lfs pull` first):
   CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task mmstar --n-eval 400 \
-      --load-adapter /home/yhlee/EfficientVLM/logs/d6_ci_s2_adapter.pt
+      --load-adapter sharing/adapters_pretrained/fine_e2e_s0.pt
   # how cheap is the adapter vs the encoder:
   CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_latency --backbone llavaov --runs 20
 

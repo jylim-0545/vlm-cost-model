@@ -11,6 +11,22 @@ d6_adapteronly,d12_holistic}.py`). 실험 결과·세팅·용어는 [`FINDINGS.m
 
 ---
 
+## 빠른 시작
+
+```bash
+git checkout feat/vtoken-share
+git lfs pull                            # 동봉된 학습 변환기(adapters_pretrained/) 받기
+python -m sharing.test_adapters         # GPU 불필요, 6개 통과 확인
+
+# 동봉 변환기로 회복률 재평가 (학습 없이, GPU):
+CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task mmstar --n-eval 400 \
+    --load-adapter sharing/adapters_pretrained/fine_e2e_s0.pt
+```
+
+처음부터 학습·전체 sweep은 아래 [사용법](#사용법-전부-gpu). 실험 배경·수치는 [FINDINGS.md](FINDINGS.md).
+
+---
+
 ## 구조 (hub-and-spoke)
 
 ```

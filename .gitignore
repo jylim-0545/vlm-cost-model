@@ -14,6 +14,8 @@ results/
 *.bin
 *.pt
 *.pth
+# EXCEPTION: a small curated set of pre-trained sharing adapters, tracked via Git LFS
+!sharing/adapters_pretrained/*.pt
 
 # Python
 __pycache__/

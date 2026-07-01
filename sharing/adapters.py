@@ -173,13 +173,15 @@ def load_study_adapter(path: str, map_location: str = "cpu") -> tuple[nn.Module,
     blob = torch.load(path, map_location=map_location, weights_only=False)
     sd = blob["state_dict"]
     mean, std = blob["xm"].float(), blob["xs"].float()
-    kind = blob.get("adapter", "?")
+    kind = blob.get("adapter") or "mlp"
     if "W" in sd:                                          # affine (raw / ridgeaffine)
         return RidgeAffine(mean, std, sd["W"], sd["b"]), kind
-    H, din = sd["net.0.weight"].shape                      # ZScoreMLP (mlp_recon / mlp_e2e)
-    dout = sd["net.2.weight"].shape[0]
+    # ZScoreMLP — keys are net.0/net.2 (d6) or bare 0/2 (d10 cross-backbone); normalize.
+    net = {(k if k.startswith("net.") else "net." + k): v for k, v in sd.items()}
+    H, din = net["net.0.weight"].shape
+    dout = net["net.2.weight"].shape[0]
     ad = ZScoreMLP(din, H, dout)
-    ad.load_state_dict({k: v for k, v in sd.items() if k.startswith("net.")}, strict=False)
+    ad.load_state_dict(net, strict=False)
     ad.set_stats(mean, std)
     return ad, kind
 

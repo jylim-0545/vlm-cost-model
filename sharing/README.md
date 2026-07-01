@@ -42,6 +42,7 @@ image ─→ SigLIP hub ─→ ├─ 변환기_B ─→ InternVL  (고정)
 | `sweep.py` | variant×seed 다중-GPU sweep (`run_B.sh` 일반화) | ○ |
 | `test_adapters.py` | 변환기 수학 단위테스트 (GPU 불필요) | ✕ |
 | `run_share_demo.sh` / `smoke.sh` | 데모 래퍼 / 풀 실행 전 tiny 스모크 | 혼합 |
+| `adapters_pretrained/` | 학습된 변환기 핵심 4개 (Git LFS, `git lfs pull`로 받음) — [매니페스트](adapters_pretrained/README.md) | — |
 
 ---
 
@@ -54,9 +55,9 @@ CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task mmstar --mode mlp_e2e
 CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task nextqa --mode raw --frames 4 --n-eval 200
 # 여러 과제 동시 (맞교환 + 망각):
 CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task mmstar --mode mlp_e2e --multitask aokvqa --forget aokvqa
-# 이미 학습된 변환기를 로드해 평가만 (학습 없음):
+# 동봉된 학습 변환기를 로드해 평가만 (학습 없음; 먼저 git lfs pull):
 CUDA_VISIBLE_DEVICES=0 python -m sharing.demo_train --task mmstar --n-eval 400 \
-    --load-adapter /home/yhlee/EfficientVLM/logs/d6_ci_s2_adapter.pt
+    --load-adapter sharing/adapters_pretrained/fine_e2e_s0.pt
 ```
 
 회복률 = 변환기 / native. 기대치: 영상 이해 raw ≈0.96; 세밀 raw 0.83 → mlp_recon 0.88 → mlp_e2e 0.91.
